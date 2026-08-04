@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+.env
+*.ducklake
+vworld_data/
+*.zip
+*.shp
+*.dbf
+*.prj
+.DS_Store
