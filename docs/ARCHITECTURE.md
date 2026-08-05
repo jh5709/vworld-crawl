@@ -12,7 +12,7 @@
 │  │ Crawler     │  │ Schema Editor │  │ DuckLake Console       │  │
 │  │ Discovery   │  │ (rename/drop  │  │ Tables, snapshots,     │  │
 │  │ + Download  │  │  columns)     │  │ compact, reindex,      │  │
-│  │ + Queue     │  │               │  │ spatial index           │  │
+│  │ + Queue     │  │               │  │ compact, expire         │  │
 │  └─────────────┘  └───────────────┘  └────────────────────────┘  │
 │       │                  │                      │                 │
 │       └──────────────────┼──────────────────────┘                 │
@@ -83,11 +83,15 @@ User enters VWorld URL
 │ - Concurrent downloads with progress     │
 │ - Queue waits for slot availability      │
 └──────────────────┬───────────────────────┘
-                   │ .zip files on disk
+                   │ .zip/.shp/.geojson/gpkg/.parquet on disk
                    ▼
 ┌──────────────────────────────────────────┐
-│ Unzip → .shp / .dbf / .prj              │
-│ Detect CRS from .prj                     │
+│ Read file → detect format                │
+│ - .zip: unzip to first spatial inside    │
+│ - .shp/.geojson/.gpkg: ST_Read           │
+│ - .parquet/.geoparquet: read_parquet     │
+│   + WKB decode or native GEOMETRY        │
+│ Detect CRS from geometry metadata        │
 │ Detect schema (columns + types)          │
 └──────────────────┬───────────────────────┘
                    │
@@ -106,10 +110,15 @@ User enters VWorld URL
 
 ### 2.2 Pipeline Phase (per dataset, all provinces)
 ```
-For each province .shp in dataset:
+For each province file in dataset:
   │
   ▼
-src.spatial(path=province.shp)
+[GDAL formats: .shp, .geojson, .gpkg]
+  src.spatial(path=province_file)
+
+[GeoParquet: .parquet, .geoparquet]
+  src.parquet(path=province_file)
+  → code.sql(EXCLUDE geom_col, ST_GeomFromWKB(geom_col) AS geom)
   │
   ▼
 xf.rename(RN="road_id", ROAD_NAME="name", LENG="length_m")
@@ -132,9 +141,8 @@ qa.geomvalidate()
                    │
                    ▼ (after all provinces appended)
          Post-crawl operations:
-           CALL ducklake_compact('roads')
-           CALL ducklake_reindex('roads')
-           CREATE INDEX roads_rtree ON roads USING RTREE(geom)
+           CALL ducklake_merge_adjacent_files('vworld', 'roads')
+           CALL ducklake_rewrite_data_files('vworld', 'roads')
 ```
 
 ### 2.3 Re-crawl (Incremental)
@@ -177,7 +185,7 @@ Re-crawl discovery → Compare against crawl_state table
 ### Screen 4: DuckLake Console
 - Table list: name, latest snapshot, file count, total size
 - Snapshot timeline per table (click to expand)
-- Table actions: Compact, Reindex, Spatial Index, Expire Snapshots
+- Table actions: Compact, Rewrite Data Files, Expire Snapshots
 - Reject table browser: inspect failed rows with error reasons
 
 ### Screen 5: Map Preview (minimal)
@@ -243,7 +251,7 @@ vworld-crawl/
 │   ├── pipeline/
 │   │   └── runner.py              # Duckle pipeline builder (thin abstraction)
 │   ├── ducklake/
-│   │   └── ops.py                 # Compact, reindex, spatial index, snapshot mgmt
+│   │   └── ops.py                 # Compact, rewrite, snapshot expiry
 │   └── ws/
 │       └── progress.py            # WebSocket progress streaming
 └── frontend/

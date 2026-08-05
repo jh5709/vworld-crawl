@@ -13,3 +13,4 @@ DuckLake uses a DuckDB file as its catalog database rather than PostgreSQL. This
 - MVP needs no external database server. DuckDB and DuckLake run in-process.
 - Data stored as open Parquet files — portable to Iceberg/Delta if DuckLake is ever swapped out.
 - If multi-user becomes required, the catalog abstraction means one environment variable and one `ATTACH` line change, plus standing up a PostgreSQL instance.
+- All DuckDB connections are centralized in `backend/db.py`, which pins the session timezone to `Asia/Seoul`, resolves catalog/data paths relative to the backend directory for CWD-independent operation, and provides a `ducklake_db()` context manager.

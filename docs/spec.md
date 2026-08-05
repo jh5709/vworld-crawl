@@ -142,7 +142,7 @@ Tests are written at the highest possible seam — the FastAPI route — exercis
 - **Scheduled/automatic crawls** — manual trigger only for MVP. Duckle's `ctl.schedule` can be added later.
 - **Multi-user support** — single-user console with DuckDB catalog. PostgreSQL migration path designed but not implemented.
 - **Forking or modifying Duckle source** — all components consumed via the Python API.
-- **Schema inference for non-shapefile formats** — only shapefiles in MVP. Duckle supports GeoJSON/GeoPackage/KML natively if needed later.
+- **Spatial indexes on DuckLake tables** — DuckLake does not support indexes. Fast bounding-box filtering is provided by the per-row `bbox_*` columns (and Parquet min/max stats). RTREE indexes, where needed, are created at read time by the consuming application (e.g. the Wails desktop).
 - **Automatic schema mapping** — column rename/drop is interactive. No ML-based column name inference.
 - **Batch editing of schema across multiple datasets** — one dataset's schema at a time.
 - **Download resume for interrupted files** — downloads restart from beginning. Full-file resume support deferred.

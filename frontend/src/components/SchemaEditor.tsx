@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { RefreshCw, Eye, EyeOff, AlertTriangle, Play } from "lucide-react";
+import PipelineProgress, { type NodeStatus } from "@/components/PipelineProgress";
 
 export interface ColumnDef {
   name: string;
@@ -40,6 +41,13 @@ interface SchemaEditorProps {
     rows_rejected?: number;
     error?: string;
   } | null;
+  pipelineProgress: {
+    phase: string;
+    file_index: number;
+    total_files: number;
+    file_name: string;
+    nodes: NodeStatus[];
+  } | null;
 }
 
 export default function SchemaEditor({
@@ -64,6 +72,7 @@ export default function SchemaEditor({
   onRunPipeline,
   pipelineLoading,
   pipelineResult,
+  pipelineProgress,
 }: SchemaEditorProps) {
   // Init mapping when columns arrive
   useEffect(() => {
@@ -315,6 +324,17 @@ export default function SchemaEditor({
             {pipelineLoading ? "Running..." : "Run Pipeline"}
           </button>
         </div>
+
+        {/* Pipeline progress */}
+        {pipelineProgress && (
+          <PipelineProgress
+            phase={pipelineProgress.phase}
+            fileIndex={pipelineProgress.file_index}
+            totalFiles={pipelineProgress.total_files}
+            fileName={pipelineProgress.file_name}
+            nodes={pipelineProgress.nodes}
+          />
+        )}
 
         {/* Pipeline result */}
         {pipelineResult && (

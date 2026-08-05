@@ -1,11 +1,11 @@
 # VWorld Crawl
 
-A geospatial data pipeline console that crawls VWorld web pages to discover, download, and process zipped shapefiles, loading them into DuckLake for querying and time-series analysis. A companion Wails desktop app provides full GIS visualization.
+A geospatial data pipeline console that crawls VWorld web pages to discover, download, and process geospatial files (shapefiles, GeoJSON, GeoPackage, GeoParquet), loading them into DuckLake for querying and time-series analysis. A companion Wails desktop app provides full GIS visualization.
 
 ## Language
 
 **Crawl**:
-A session that discovers downloadable shapefile links from one or more paginated VWorld web pages.
+A session that discovers downloadable geospatial file links from one or more paginated VWorld web pages.
 _Avoid_: Scrape, spider
 
 **Discovery**:
@@ -13,12 +13,16 @@ The first phase of a crawl — walks paginated pages, accumulates a file list. N
 _Avoid_: Scan, enumerate
 
 **Dataset**:
-A logical grouping of shapefiles that share the same schema (e.g., roads, buildings, parcels). One dataset = one DuckLake table. A dataset may span multiple provinces, each delivered as a separate `.zip` file.
+A logical grouping of files that share the same schema (e.g., roads, buildings, parcels). One dataset = one DuckLake table. A dataset may span multiple provinces, each delivered as a separate file (`.zip`, `.shp`, `.geojson`, `.gpkg`, `.parquet`).
 _Avoid_: Layer, theme, category
 
 **Province file**:
-A single `.zip` containing `.shp`/`.dbf`/`.prj` for one province within a dataset. Appended into the dataset's DuckLake table.
+A single file containing the geospatial data for one province within a dataset. Appended into the dataset's DuckLake table. Supported formats: `.shp`, `.geojson`, `.gpkg` (read via GDAL/ST_Read), `.parquet`/`.geoparquet` (read via DuckDB's `read_parquet` with WKB geometry decoding), and `.zip` (unzipped to the first supported spatial file inside).
 _Avoid_: Tile, partition, chunk
+
+**Source file**:
+A supported geospatial file on disk, auto-detected by extension. When a `.zip` archive contains multiple files, the first spatial file (priority: `.shp` → `.gpkg` → `.geojson` → `.parquet`) is used.
+_Avoid_: Input file, raw file
 
 **Table**:
 A DuckLake table representing one dataset. Schema evolves across DuckLake snapshots (v1 = raw VWorld schema, v2 = cleaned schema with renamed columns, etc.).
@@ -57,11 +61,11 @@ The publication date of a delta file, stored as an explicit `data_date` column i
 _Avoid_: Version date, effective date, as-of date
 
 **Pipeline**:
-A Duckle-compiled execution graph: `src.spatial → xf.rename → xf.project → qa.geomvalidate → snk.ducklake`. Defined in Python via the Duckle API, triggered from the web GUI.
+A Duckle-compiled execution graph. For GDAL formats (`.shp`, `.geojson`, `.gpkg`): `src.spatial → … → snk.ducklake`. For GeoParquet (`.parquet`, `.geoparquet`): `src.parquet → WKB decode → … → snk.ducklake`. Defined in Python via the Duckle API, triggered from the web GUI.
 _Avoid_: Job, workflow, DAG
 
 **Post-crawl**:
-Operations that run once after all province files are appended: compact (merge Parquet files), reindex (rebuild metadata), spatial index (RTREE on geometry for bounding-box queries).
+Operations that run once after all province files are appended: compact (merge adjacent Parquet files), rewrite data files (rebuild metadata). Spatial indexes are not available on DuckLake tables — the per-row `bbox_*` columns and Parquet zone maps provide bounding-box filtering instead. RTREE indexes are created at read time by the Wails desktop when it materializes a table locally.
 _Avoid_: Finalize, optimize, cleanup
 
 **Wails desktop**:
@@ -97,5 +101,13 @@ Well-Known Binary geometry encoding. Every row in the DuckLake table includes a 
 _Avoid_: Binary geometry, hex geometry
 
 **Bounding box columns**:
-Per-row `bbox_xmin`, `bbox_ymin`, `bbox_xmax`, `bbox_ymax` columns for fast spatial filtering without deserializing the full geometry.
+Per-row `bbox_xmin`, `bbox_ymin`, `bbox_xmax`, `bbox_ymax` columns for fast spatial filtering without deserializing the full geometry. These columns are the primary spatial access path: DuckLake does not support native indexes (RTREE, ART), so Parquet zone maps (min/max statistics) on the bbox columns serve as the lakehouse equivalent of a spatial index, pruning row groups during filtered scans.
 _Avoid_: Envelope, extent
+
+**GeoParquet**:
+An OGC standard for encoding geospatial vector data in Apache Parquet files. Geometry is stored as a WKB blob column with `geo` key-value metadata specifying the primary geometry column and CRS. DuckDB-written native GEOMETRY columns are also supported. Read via DuckDB's `read_parquet` + `ST_GeomFromWKB` when the column is a WKB BLOB, or used directly when it is already a GEOMETRY type.
+_Avoid_: Spatial Parquet, geospatial parquet
+
+**Catalog**:
+The DuckLake metadata file (`ducklake_metadata.ducklake`) plus its data directory (`.ducklake.files/`). All console operations (table list, snapshots, compact, expire) target this catalog. Paths are resolved relative to the backend directory, not the current working directory.
+_Avoid_: Database, lake

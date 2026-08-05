@@ -23,11 +23,27 @@ Usage:
 import logging
 import os
 import shutil
+import io
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 import duckle
 
-from schema_detector import _unzip_shapefile
+from db import data_path as _default_data_path
+from db import ducklake_db, metadata_path as _default_metadata_path
+from schema_detector import (
+    _get_conn,
+    _is_parquet,
+    _unzip_spatial,
+    parquet_geometry_info,
+)
+from pipeline.progress import (
+    NodeProgress,
+    PipelineProgress,
+    parse_duckle_output,
+    create_initial_progress,
+    VALID_NODES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +75,8 @@ def _run_single_file(
     metadata_path: str,
     *,
     keep_valid: bool,
-) -> int:
+    progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
+) -> list[NodeProgress]:
     """
     Run the pipeline for a single province file.
 
@@ -70,12 +87,15 @@ def _run_single_file(
         data_path: DuckLake DATA_PATH directory.
         metadata_path: DuckLake metadata file path.
         keep_valid: True → valid rows go to {dataset}; False → invalid rows go to {dataset}_rejects.
+        progress_callback: Called with PipelineProgress updates (for WebSocket streaming).
 
     Returns:
-        Number of rows written.
+        List of NodeProgress from duckle's output.
     """
-    # Build drop, keep, rename maps
-    drop_cols = ["OGC_FID"] + [c["original"] for c in column_mapping if c.get("drop")]
+    # Build drop, keep, rename maps.
+    # Note: OGC_FID is not force-dropped here — xf.project already restricts
+    # output to keep_cols, and OGC_FID doesn't exist in GPKG/GeoParquet.
+    drop_cols = [c["original"] for c in column_mapping if c.get("drop")]
     keep_cols = [c["original"] for c in column_mapping if not c.get("drop")]
     # Always include geom (needed for WKB, bbox, and validation)
     if "geom" not in keep_cols:
@@ -89,18 +109,35 @@ def _run_single_file(
     mode = "valid" if keep_valid else "invalid"
     table_name = dataset_name if keep_valid else f"{dataset_name}_rejects"
 
-    # Handle .zip files: unzip to temp dir, pass .shp to duckle
+    # Handle .zip files: unzip to temp dir, pass the spatial file to duckle
     read_path = shapefile_path
     tmpdir = None
     if shapefile_path.lower().endswith(".zip"):
-        read_path = _unzip_shapefile(shapefile_path)
-        tmpdir = os.path.dirname(read_path)
+        read_path, tmpdir = _unzip_spatial(shapefile_path)
 
     p = duckle.Pipeline()
 
     try:
-        # 1. Source: read shapefile
-        p.source("src.spatial", path=read_path)
+        # 1. Source: read the file. GeoParquet goes through src.parquet +
+        #    WKB decode (ST_Read/GDAL can't read Parquet); everything else
+        #    (.shp, .geojson, .gpkg) via src.spatial (ST_Read).
+        if _is_parquet(read_path):
+            info = parquet_geometry_info(_get_conn(), read_path)
+            if not info:
+                raise ValueError(
+                    f"No geometry column found in {os.path.basename(read_path)} "
+                    f"(expected WKB BLOB or GEOMETRY column — is this a GeoParquet file?)"
+                )
+            geom_col, needs_decode = info
+            geom_expr = (f'ST_GeomFromWKB("{geom_col}")' if needs_decode
+                         else f'"{geom_col}"')
+            p.source("src.parquet", path=read_path)
+            p.transform(
+                "code.sql",
+                sql=f'SELECT * EXCLUDE ("{geom_col}"), {geom_expr} AS geom FROM input',
+            )
+        else:
+            p.source("src.spatial", path=read_path)
 
         # 2. Drop columns: OGC_FID + user-dropped
         if drop_cols:
@@ -139,11 +176,36 @@ def _run_single_file(
             mode="append",
         )
 
-        result = p.run()
+        # Capture duckle's stdout to parse progress
+        buf = io.StringIO()
+        import sys as _sys
+        _stdout = _sys.stdout
+        _sys.stdout = buf
+        try:
+            p.run()
+        finally:
+            _sys.stdout = _stdout
+        
+        duckle_output = buf.getvalue()
         logger.info(
-            "Pipeline %s → %s: %s", os.path.basename(shapefile_path), table_name, result
+            "Pipeline %s → %s completed", os.path.basename(shapefile_path), table_name
         )
-        return 0
+        
+        # Parse node progress
+        nodes = parse_duckle_output(duckle_output)
+        
+        # Notify callback
+        if progress_callback:
+            progress = PipelineProgress(
+                phase="valid" if keep_valid else "invalid",
+                file_index=0,
+                total_files=1,
+                file_name=os.path.basename(shapefile_path),
+                nodes=nodes,
+            )
+            progress_callback(progress)
+        
+        return nodes
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -157,15 +219,17 @@ def run_pipeline(
     shapefile_paths: list[str],
     dataset_name: str,
     column_mapping: list[dict],
-    data_path: str = "vworld_data/",
-    metadata_path: str = "catalog/ducklake_metadata.ducklake",
+    data_path: str | None = None,
+    metadata_path: str | None = None,
+    progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
 ) -> PipelineResult:
     """
     Run the full pipeline for one dataset across all province files.
 
     For each province file:
-      1. src.spatial → read shapefile
-      2. xf.dropcol → remove OGC_FID + user-dropped columns
+      1. src.spatial → read shapefile (.zip unzipped first)
+         (src.parquet + WKB decode for .parquet/.geoparquet)
+      2. xf.dropcol → remove user-dropped columns
       3. xf.project → keep non-dropped columns
       4. xf.rename → apply user renames
       5. code.sql → add geom_wkb, bbox_xmin/ymin/xmax/ymax
@@ -191,9 +255,9 @@ def run_pipeline(
         result.error = "No shapefiles provided"
         return result
 
-    # Resolve absolute paths
-    data_path = os.path.abspath(data_path)
-    metadata_path = os.path.abspath(metadata_path)
+    # Resolve absolute paths (default: anchored at the backend directory)
+    data_path = os.path.abspath(data_path or str(_default_data_path()))
+    metadata_path = os.path.abspath(metadata_path or str(_default_metadata_path()))
 
     # Ensure directories exist
     os.makedirs(data_path, exist_ok=True)
@@ -202,12 +266,20 @@ def run_pipeline(
     total_loaded = 0
     total_rejected = 0
 
-    for path in shapefile_paths:
+    for idx, path in enumerate(shapefile_paths):
         if not os.path.exists(path):
             logger.warning("Skipping missing file: %s", path)
             continue
 
+        file_name = os.path.basename(path)
+
         try:
+            # Send initial pending state for valid pass
+            if progress_callback:
+                progress_callback(create_initial_progress(
+                    idx, len(shapefile_paths), file_name, "valid"
+                ))
+
             # Pass 1: valid rows → main table
             _run_single_file(
                 path,
@@ -216,7 +288,14 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=True,
+                progress_callback=progress_callback,
             )
+
+            # Send initial pending state for invalid pass
+            if progress_callback:
+                progress_callback(create_initial_progress(
+                    idx, len(shapefile_paths), file_name, "invalid"
+                ))
 
             # Pass 2: invalid rows → rejects table
             _run_single_file(
@@ -226,6 +305,7 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=False,
+                progress_callback=progress_callback,
             )
 
             result.files_processed += 1
@@ -242,32 +322,17 @@ def run_pipeline(
 
     # Estimate row counts by querying DuckLake
     try:
-        import duckdb
+        with ducklake_db(catalog=metadata_path) as db:
+            total_loaded = db.execute(
+                f"SELECT count(*) FROM vworld.{dataset_name}"
+            ).fetchone()[0]
 
-        db = duckdb.connect(":memory:")
-        db.execute("INSTALL ducklake; LOAD ducklake;")
-        db.execute(
-            f"ATTACH 'ducklake:{metadata_path}' AS vworld"
-        )
-
-        # Count valid rows
-        valid = db.execute(
-            f"SELECT count(*) FROM vworld.{dataset_name}"
-        ).fetchone()
-        if valid:
-            total_loaded = valid[0]
-
-        # Count rejected rows
-        try:
-            invalid = db.execute(
-                f"SELECT count(*) FROM vworld.{dataset_name}_rejects"
-            ).fetchone()
-            if invalid:
-                total_rejected = invalid[0]
-        except Exception:
-            pass  # rejects table may not exist if no invalid geometries
-
-        db.close()
+            try:
+                total_rejected = db.execute(
+                    f"SELECT count(*) FROM vworld.{dataset_name}_rejects"
+                ).fetchone()[0]
+            except Exception:
+                pass  # rejects table may not exist if no invalid geometries
     except Exception as e:
         logger.warning("Could not query row counts: %s", e)
 
@@ -291,43 +356,25 @@ def run_pipeline(
 
 def post_crawl_compact(
     dataset_name: str,
-    metadata_path: str = "catalog/ducklake_metadata.ducklake",
-    data_path: str = "vworld_data/",
+    metadata_path: str | None = None,
+    data_path: str | None = None,
 ) -> None:
     """
     Run post-crawl maintenance on a dataset table.
 
-    Operations:
-      1. Merge adjacent Parquet files (compaction)
-      2. RTREE spatial index for fast bounding-box queries
+    Operations: merge adjacent Parquet files (compaction).
+    Spatial indexing is not attempted — DuckLake does not support indexes;
+    the bbox_* columns provide fast bounding-box filtering.
 
     Should be called after all province files for a dataset have been loaded.
     """
-    import duckdb
-
-    db = duckdb.connect(":memory:")
-    try:
-        db.execute("INSTALL spatial; LOAD spatial;")
-        db.execute("INSTALL ducklake; LOAD ducklake;")
-        db.execute(
-            f"ATTACH 'ducklake:{metadata_path}' AS vworld"
-        )
-
+    with ducklake_db(catalog=metadata_path) as db:
         logger.info("Post-crawl: merging files for %s...", dataset_name)
         try:
-            db.execute(f"CALL ducklake_merge_adjacent_files('{dataset_name}', 'vworld')")
+            db.execute(
+                "CALL ducklake_merge_adjacent_files('vworld', ?)", [dataset_name]
+            )
         except Exception as e:
             logger.warning("Merge skipped: %s", e)
 
-        logger.info("Post-crawl: creating spatial index on %s...", dataset_name)
-        try:
-            db.execute(
-                f"CREATE INDEX IF NOT EXISTS {dataset_name}_rtree "
-                f"ON vworld.{dataset_name} USING RTREE(geom)"
-            )
-        except Exception as e:
-            logger.warning("Spatial index skipped (DuckLake may not support indexes): %s", e)
-
         logger.info("Post-crawl complete for %s", dataset_name)
-    finally:
-        db.close()

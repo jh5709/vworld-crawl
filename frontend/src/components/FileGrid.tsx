@@ -78,7 +78,7 @@ export default function FileGrid({
       <div className="p-6 text-center text-sm text-neutral-600">
         <FolderOpen className="w-8 h-8 mx-auto mb-2 opacity-40" />
         <p>No supported files found</p>
-        <p className="text-xs mt-1">.zip and .shp files will appear here</p>
+        <p className="text-xs mt-1">.zip, .shp, .geojson, .gpkg, .geoparquet files will appear here</p>
       </div>
     );
   }

@@ -11,5 +11,7 @@ The pipeline operations console is a React web app with a FastAPI backend. A sep
 
 **Consequences:**
 - The web app must emit WKB geometry + bounding box columns for the Wails desktop to consume efficiently.
+- DuckLake does not support native indexes (RTREE, ART). Spatial access relies on the per-row `bbox_*` columns with Parquet zone-map pruning. RTREE indexes are created at read time by the Wails desktop when it materializes a table into a local DuckDB session.
+- The pipeline supports multiple geospatial source formats (`.shp`, `.geojson`, `.gpkg`, `.parquet`, `.geoparquet`, `.zip`) through a single code path — Duckle's `src.spatial` for GDAL formats and `src.parquet` + WKB decode for GeoParquet.
 - Real-time pipeline progress streams via WebSocket to the web GUI.
 - The web app is the trigger point; the Wails desktop is downstream read-only.

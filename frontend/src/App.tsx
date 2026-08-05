@@ -1,15 +1,16 @@
 import { useState } from "react";
 import { Database, Layers } from "lucide-react";
 import DirectoryPicker from "@/components/DirectoryPicker";
+import DuckLakeConsole from "@/components/DuckLakeConsole";
 import FileGrid, { type FileEntry } from "@/components/FileGrid";
 import SchemaEditor, {
   type ColumnDef,
   type ColumnMapping,
 } from "@/components/SchemaEditor";
+import { type NodeStatus } from "@/components/PipelineProgress";
+import { API, wsUrl } from "@/lib/api";
 
-const API = "http://localhost:8000";
-
-type View = "picker" | "grid" | "schema";
+type View = "picker" | "grid" | "schema" | "console";
 
 export default function App() {
   // Directory scanning
@@ -46,6 +47,13 @@ export default function App() {
     rows_loaded?: number;
     rows_rejected?: number;
     error?: string;
+  } | null>(null);
+  const [pipelineProgress, setPipelineProgress] = useState<{
+    phase: string;
+    file_index: number;
+    total_files: number;
+    file_name: string;
+    nodes: NodeStatus[];
   } | null>(null);
 
   // --- Scan directory ---
@@ -158,34 +166,55 @@ export default function App() {
   const selectAll = () => setSelected(new Set(files.map((f) => f.path)));
   const deselectAll = () => setSelected(new Set());
 
-  // --- Run Pipeline ---
-  const handleRunPipeline = async () => {
+  // --- Run Pipeline (WebSocket) ---
+  const handleRunPipeline = () => {
     if (!inspectFile || !datasetName.trim()) return;
     setPipelineLoading(true);
     setPipelineResult(null);
+    setPipelineProgress(null);
 
-    // Collect all selected file paths (or just the inspected one)
     const paths = selected.size > 0
       ? Array.from(selected)
       : [inspectFile.path];
 
-    try {
-      const res = await fetch(`${API}/api/run-pipeline`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          paths,
-          dataset_name: datasetName.trim(),
-          column_mapping: mapping,
-        }),
-      });
-      const data = await res.json();
-      setPipelineResult(data);
-    } catch (e: any) {
-      setPipelineResult({ success: false, error: e.message ?? "Pipeline failed" });
-    } finally {
+    const ws = new WebSocket(wsUrl("/ws/pipeline"));
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        paths,
+        dataset_name: datasetName.trim(),
+        column_mapping: mapping,
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === "progress") {
+        setPipelineProgress({
+          phase: data.phase,
+          file_index: data.file_index,
+          total_files: data.total_files,
+          file_name: data.file_name,
+          nodes: data.nodes,
+        });
+      } else if (data.type === "complete") {
+        setPipelineResult({
+          success: data.success,
+          rows_loaded: data.rows_loaded,
+          rows_rejected: data.rows_rejected,
+          error: data.error,
+        });
+        setPipelineLoading(false);
+      } else if (data.type === "error") {
+        setPipelineResult({ success: false, error: data.error });
+        setPipelineLoading(false);
+      }
+    };
+
+    ws.onerror = () => {
+      setPipelineResult({ success: false, error: "WebSocket connection failed" });
       setPipelineLoading(false);
-    }
+    };
   };
 
   return (
@@ -231,12 +260,13 @@ export default function App() {
 
           {/* Nav tabs */}
           <div className="ml-auto flex items-center gap-1">
-            {(["picker", "grid", "schema"] as const).map((v) => (
+            {(["picker", "grid", "schema", "console"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => {
                   if (v === "grid" && files.length > 0) setView("grid");
                   else if (v === "schema" && inspectFile) setView("schema");
+                  else if (v === "console") setView("console");
                   else setView("picker");
                 }}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
@@ -245,7 +275,7 @@ export default function App() {
                     : "text-neutral-600 hover:text-neutral-400"
                 }`}
               >
-                {v === "picker" ? "Source" : v === "grid" ? "Files" : "Schema"}
+                {v === "picker" ? "Source" : v === "grid" ? "Files" : v === "schema" ? "Schema" : "Console"}
               </button>
             ))}
           </div>
@@ -318,9 +348,12 @@ export default function App() {
               onRunPipeline={handleRunPipeline}
               pipelineLoading={pipelineLoading}
               pipelineResult={pipelineResult}
+              pipelineProgress={pipelineProgress}
             />
           </div>
         )}
+
+        {view === "console" && <DuckLakeConsole />}
       </main>
     </div>
   );

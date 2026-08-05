@@ -13,5 +13,5 @@ Each VWorld dataset (roads, buildings, parcels) maps to a single DuckLake table.
 - Each dataset table starts with the VWorld schema and evolves as the user renames/drops columns.
 - Time travel (`AT SNAPSHOT 'v1'`) recovers the raw schema at any time.
 - Province append is a simple `write_mode="append"` — no merge node needed.
-- Post-crawl compact + reindex + spatial index applies once per dataset table.
+- Post-crawl compact + rewrite data files applies once per dataset table. Spatial indexes are not supported by DuckLake; the per-row `bbox_*` columns and Parquet zone maps provide the spatial access path.
 - The DuckLake console shows snapshot history per table with the column changes between versions.

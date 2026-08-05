@@ -7,11 +7,12 @@ and exposes REST + WebSocket endpoints for pipeline operations.
 
 import logging
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import duckdb
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -161,6 +162,15 @@ async def api_preview(req: PreviewRequest):
 
 
 from pipeline import run_pipeline, post_crawl_compact
+from db import data_path, metadata_path
+from ducklake_console import (
+    table_list,
+    table_preview,
+    table_snapshots,
+    compact_table,
+    reindex_table,
+    expire_snapshots,
+)
 
 
 class PipelineRequest(BaseModel):
@@ -177,10 +187,8 @@ async def api_run_pipeline(req: PipelineRequest):
             shapefile_paths=req.paths,
             dataset_name=req.dataset_name,
             column_mapping=req.column_mapping,
-            data_path=os.getenv("VWORLD_DUCKLAKE_DATA_PATH", "vworld_data/"),
-            metadata_path=os.getenv(
-                "VWORLD_DUCKLAKE_METADATA_PATH", "catalog/ducklake_metadata.ducklake"
-            ),
+            data_path=str(data_path()),
+            metadata_path=str(metadata_path()),
         )
 
         if result.error:
@@ -206,82 +214,182 @@ async def api_run_pipeline(req: PipelineRequest):
         return {"success": False, "error": str(e)}
 
 
+@app.websocket("/ws/pipeline")
+async def ws_pipeline(ws: WebSocket):
+    """WebSocket endpoint for real-time pipeline progress."""
+    import json as _json
+    
+    await ws.accept()
+    
+    try:
+        # Receive pipeline parameters
+        raw = await ws.receive_text()
+        params = _json.loads(raw)
+        
+        paths = params.get("paths", [])
+        dataset_name = params.get("dataset_name", "")
+        column_mapping = params.get("column_mapping", [])
+        
+        if not paths or not dataset_name:
+            await ws.send_text(_json.dumps({
+                "type": "error",
+                "error": "paths and dataset_name are required"
+            }))
+            await ws.close()
+            return
+        
+        # Progress callback: send events over WebSocket
+        async def send_progress(progress):
+            try:
+                await ws.send_text(_json.dumps({
+                    "type": "progress",
+                    "phase": progress.phase,
+                    "file_index": progress.file_index,
+                    "total_files": progress.total_files,
+                    "file_name": progress.file_name,
+                    "nodes": [
+                        {
+                            "name": n.name,
+                            "status": n.status,
+                            "rows": n.rows,
+                            "error": n.error or None,
+                        }
+                        for n in progress.nodes
+                    ],
+                }, default=str))
+            except Exception:
+                pass
+        
+        # Run pipeline in a thread so the event loop stays responsive
+        import concurrent.futures
+        
+        def run_in_thread():
+            return run_pipeline(
+                shapefile_paths=paths,
+                dataset_name=dataset_name,
+                column_mapping=column_mapping,
+                data_path=str(data_path()),
+                metadata_path=str(metadata_path()),
+                progress_callback=lambda p: asyncio.run_coroutine_threadsafe(
+                    send_progress(p), loop
+                ),
+            )
+        
+        loop = asyncio.get_running_loop()
+        
+        # Send start event
+        await ws.send_text(_json.dumps({
+            "type": "start",
+            "dataset": dataset_name,
+            "total_files": len(paths),
+        }))
+        
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(run_in_thread)
+            result = await asyncio.wrap_future(future)
+        
+        # Post-crawl (non-fatal)
+        if result.rows_loaded > 0:
+            try:
+                post_crawl_compact(result.dataset)
+            except Exception as e:
+                logger.warning("Post-crawl error (non-fatal): %s", e)
+        
+        # Send completion
+        await ws.send_text(_json.dumps({
+            "type": "complete",
+            "success": not result.error,
+            "dataset": result.dataset,
+            "table_name": result.table_name,
+            "rows_loaded": result.rows_loaded,
+            "rows_rejected": result.rows_rejected,
+            "files_processed": result.files_processed,
+            "error": result.error or None,
+        }))
+        
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.exception("WebSocket pipeline error")
+        try:
+            await ws.send_text(_json.dumps({
+                "type": "error",
+                "error": str(e)
+            }))
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 # --- DuckLake Data Viewer (quick access before console is built) ---
+
+
+@app.get("/api/pick-directory")
+async def api_pick_directory():
+    """Open a native folder picker dialog and return the selected path."""
+    import subprocess
+    
+    # Try common Linux file pickers, fall back gracefully
+    for cmd in [
+        ["zenity", "--file-selection", "--directory", "--title=Select Shapefile Directory"],
+        ["kdialog", "--getexistingdirectory"],
+        ["zenity", "--file-selection", "--title=Select Shapefile Directory"],
+    ]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                return {"path": result.stdout.strip()}
+        except Exception:
+            continue
+    
+    return {"path": "", "error": "No folder picker available. Type the path manually."}
 
 @app.get("/api/tables")
 async def api_list_tables():
-    """List all tables in the DuckLake catalog."""
-    import duckdb
-
-    metadata_path = os.getenv(
-        "VWORLD_DUCKLAKE_METADATA_PATH", "catalog/ducklake_metadata.ducklake"
-    )
-    if not os.path.exists(metadata_path):
+    """List all tables in the DuckLake catalog with stats."""
+    if not metadata_path().exists():
         return {"tables": [], "note": "No catalog found. Run a pipeline first."}
-
-    db = duckdb.connect(":memory:")
-    try:
-        db.execute("INSTALL ducklake; LOAD ducklake;")
-        db.execute(f"ATTACH 'ducklake:{metadata_path}' AS vworld")
-
-        tables = db.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='vworld'"
-        ).fetchall()
-
-        result = []
-        for (name,) in tables:
-            count = db.execute(f"SELECT count(*) FROM vworld.{name}").fetchone()[0]
-            cols = db.execute(f"DESCRIBE vworld.{name}").fetchall()
-            result.append({
-                "name": name,
-                "rows": count,
-                "columns": [{"name": c[0], "type": c[1]} for c in cols],
-            })
-        return {"tables": result}
-    finally:
-        db.close()
+    return {"tables": table_list()}
 
 
 @app.get("/api/tables/{table_name}")
 async def api_table_data(table_name: str, limit: int = 20, offset: int = 0):
-    """Get rows from a DuckLake table."""
-    import duckdb
-
-    metadata_path = os.getenv(
-        "VWORLD_DUCKLAKE_METADATA_PATH", "catalog/ducklake_metadata.ducklake"
-    )
-    db = duckdb.connect(":memory:")
+    """Get rows from a DuckLake table (geometry/blob columns hidden)."""
     try:
-        db.execute("INSTALL ducklake; LOAD ducklake;")
-        db.execute(f"ATTACH 'ducklake:{metadata_path}' AS vworld")
-
-        count = db.execute(
-            f"SELECT count(*) FROM vworld.{table_name}"
-        ).fetchone()[0]
-
-        cols = db.execute(f"DESCRIBE vworld.{table_name}").fetchall()
-
-        # Skip geometry and blob columns for display
-        display_cols = [
-            c[0] for c in cols
-            if c[1] not in ("GEOMETRY", "BLOB", "BIGINT") or c[0] == "id"
-        ]
-
-        rows = db.execute(
-            f"SELECT {', '.join(display_cols)} FROM vworld.{table_name} "
-            f"LIMIT {limit} OFFSET {offset}"
-        ).fetchall()
-
-        return {
-            "table": table_name,
-            "total_rows": count,
-            "columns": display_cols,
-            "rows": [dict(zip(display_cols, r)) for r in rows],
-        }
+        return table_preview(table_name, limit, offset)
     except Exception as e:
         return {"error": str(e)}
-    finally:
-        db.close()
+
+
+@app.get("/api/tables/{table_name}/snapshots")
+async def api_table_snapshots(table_name: str):
+    """Get snapshot timeline for a table."""
+    return {"snapshots": table_snapshots(table_name)}
+
+
+@app.post("/api/tables/{table_name}/compact")
+async def api_compact_table(table_name: str):
+    """Compact a table by merging adjacent files."""
+    return compact_table(table_name)
+
+
+@app.post("/api/tables/{table_name}/reindex")
+async def api_reindex_table(table_name: str):
+    """Reindex a table by rewriting data files."""
+    return reindex_table(table_name)
+
+
+@app.post("/api/ducklake/expire-snapshots")
+async def api_expire_snapshots(days: int = 30, dry_run: bool = False):
+    """Expire catalog snapshots older than N days (catalog-wide).
+
+    dry_run=true previews what would be expired without changing anything.
+    """
+    return expire_snapshots(days, dry_run)
 
 
 # --- Static Files (React frontend) ---
