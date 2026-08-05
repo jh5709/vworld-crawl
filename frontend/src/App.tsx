@@ -1,0 +1,327 @@
+import { useState } from "react";
+import { Database, Layers } from "lucide-react";
+import DirectoryPicker from "@/components/DirectoryPicker";
+import FileGrid, { type FileEntry } from "@/components/FileGrid";
+import SchemaEditor, {
+  type ColumnDef,
+  type ColumnMapping,
+} from "@/components/SchemaEditor";
+
+const API = "http://localhost:8000";
+
+type View = "picker" | "grid" | "schema";
+
+export default function App() {
+  // Directory scanning
+  const [view, setView] = useState<View>("picker");
+  const [files, setFiles] = useState<FileEntry[]>([]);
+  const [scanPath, setScanPath] = useState("");
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Schema detection
+  const [inspectFile, setInspectFile] = useState<FileEntry | null>(null);
+  const [columns, setColumns] = useState<ColumnDef[]>([]);
+  const [crs, setCrs] = useState("");
+  const [geometryType, setGeometryType] = useState("");
+  const [rowCount, setRowCount] = useState(0);
+  const [validCount, setValidCount] = useState(0);
+  const [invalidCount, setInvalidCount] = useState(0);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+
+  // Column mapping + preview
+  const [mapping, setMapping] = useState<ColumnMapping[]>([]);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewColumns, setPreviewColumns] = useState<string[]>([]);
+  const [previewRows, setPreviewRows] = useState<Record<string, unknown>[]>([]);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // Pipeline
+  const [datasetName, setDatasetName] = useState("");
+  const [pipelineLoading, setPipelineLoading] = useState(false);
+  const [pipelineResult, setPipelineResult] = useState<{
+    success?: boolean;
+    rows_loaded?: number;
+    rows_rejected?: number;
+    error?: string;
+  } | null>(null);
+
+  // --- Scan directory ---
+  const handleScan = async (path: string) => {
+    setScanPath(path);
+    setScanLoading(true);
+    setScanError(null);
+    setFiles([]);
+    setView("grid");
+    setSelected(new Set());
+    setInspectFile(null);
+
+    try {
+      const res = await fetch(`${API}/api/scan-directory`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setScanError(data.error);
+      } else {
+        setFiles(data.files ?? []);
+      }
+    } catch (e: any) {
+      setScanError(e.message ?? "Failed to scan directory");
+    } finally {
+      setScanLoading(false);
+    }
+  };
+
+  // --- Detect schema ---
+  const handleInspect = async (file: FileEntry) => {
+    setInspectFile(file);
+    setView("schema");
+    setSchemaLoading(true);
+    setSchemaError(null);
+    setColumns([]);
+    setMapping([]);
+    setPreviewColumns([]);
+    setPreviewRows([]);
+    setPreviewError(null);
+
+    try {
+      const res = await fetch(`${API}/api/detect-schema`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: file.path }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setSchemaError(data.error);
+      } else {
+        setColumns(data.columns ?? []);
+        setCrs(data.crs ?? "");
+        setGeometryType(data.geometry_type ?? "");
+        setRowCount(data.row_count ?? 0);
+        setValidCount(data.valid_count ?? 0);
+        setInvalidCount(data.invalid_count ?? 0);
+      }
+    } catch (e: any) {
+      setSchemaError(e.message ?? "Failed to detect schema");
+    } finally {
+      setSchemaLoading(false);
+    }
+  };
+
+  // --- Preview ---
+  const handlePreview = async () => {
+    if (!inspectFile) return;
+    setPreviewLoading(true);
+    setPreviewError(null);
+    setPreviewColumns([]);
+    setPreviewRows([]);
+
+    try {
+      const res = await fetch(`${API}/api/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: inspectFile.path,
+          columns: mapping,
+          limit: 10,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setPreviewError(data.error);
+      } else {
+        setPreviewColumns(data.columns ?? []);
+        setPreviewRows(data.rows ?? []);
+      }
+    } catch (e: any) {
+      setPreviewError(e.message ?? "Failed to load preview");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  // --- Selection ---
+  const toggleFile = (path: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const selectAll = () => setSelected(new Set(files.map((f) => f.path)));
+  const deselectAll = () => setSelected(new Set());
+
+  // --- Run Pipeline ---
+  const handleRunPipeline = async () => {
+    if (!inspectFile || !datasetName.trim()) return;
+    setPipelineLoading(true);
+    setPipelineResult(null);
+
+    // Collect all selected file paths (or just the inspected one)
+    const paths = selected.size > 0
+      ? Array.from(selected)
+      : [inspectFile.path];
+
+    try {
+      const res = await fetch(`${API}/api/run-pipeline`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paths,
+          dataset_name: datasetName.trim(),
+          column_mapping: mapping,
+        }),
+      });
+      const data = await res.json();
+      setPipelineResult(data);
+    } catch (e: any) {
+      setPipelineResult({ success: false, error: e.message ?? "Pipeline failed" });
+    } finally {
+      setPipelineLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-neutral-50">
+      {/* Header */}
+      <header className="border-b border-neutral-900 bg-neutral-950/80 backdrop-blur-sm sticky top-0 z-10">
+        <div className="max-w-5xl mx-auto px-6 py-3 flex items-center gap-3">
+          <Database className="w-5 h-5 text-emerald-400" />
+          <h1 className="text-sm font-semibold tracking-tight">VWorld Crawl</h1>
+
+          {/* Breadcrumb */}
+          <div className="flex items-center gap-1.5 ml-4 text-xs text-neutral-600">
+            <button
+              onClick={() => {
+                setView("picker");
+                setInspectFile(null);
+              }}
+              className="hover:text-neutral-400 transition-colors"
+            >
+              Source
+            </button>
+            {scanPath && (
+              <>
+                <span>/</span>
+                <button
+                  onClick={() => {
+                    setView("grid");
+                    setInspectFile(null);
+                  }}
+                  className="hover:text-neutral-400 transition-colors"
+                >
+                  {scanPath.split("/").pop() || scanPath}
+                </button>
+              </>
+            )}
+            {inspectFile && (
+              <>
+                <span>/</span>
+                <span className="text-neutral-400">{inspectFile.name}</span>
+              </>
+            )}
+          </div>
+
+          {/* Nav tabs */}
+          <div className="ml-auto flex items-center gap-1">
+            {(["picker", "grid", "schema"] as const).map((v) => (
+              <button
+                key={v}
+                onClick={() => {
+                  if (v === "grid" && files.length > 0) setView("grid");
+                  else if (v === "schema" && inspectFile) setView("schema");
+                  else setView("picker");
+                }}
+                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                  view === v
+                    ? "bg-neutral-800 text-neutral-200"
+                    : "text-neutral-600 hover:text-neutral-400"
+                }`}
+              >
+                {v === "picker" ? "Source" : v === "grid" ? "Files" : "Schema"}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      {/* Body */}
+      <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
+        {view === "picker" && (
+          <DirectoryPicker onScan={handleScan} loading={scanLoading} />
+        )}
+
+        {view === "grid" && (
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
+              <Layers className="w-4 h-4 text-neutral-600" />
+              <h2 className="text-sm font-medium text-neutral-400">
+                {scanPath || "Scanned Files"}
+              </h2>
+              <button
+                onClick={() => setView("picker")}
+                className="ml-auto text-xs text-neutral-600 hover:text-neutral-400 transition-colors"
+              >
+                ← Change directory
+              </button>
+            </div>
+            <FileGrid
+              files={files}
+              selected={selected}
+              onToggle={toggleFile}
+              onSelectAll={selectAll}
+              onDeselectAll={deselectAll}
+              onInspect={handleInspect}
+              loading={scanLoading}
+              error={scanError}
+            />
+          </div>
+        )}
+
+        {view === "schema" && (
+          <div className="space-y-4">
+            <button
+              onClick={() => {
+                setView("grid");
+                setInspectFile(null);
+              }}
+              className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors"
+            >
+              ← Back to files
+            </button>
+            <SchemaEditor
+              file={inspectFile ? { name: inspectFile.name, path: inspectFile.path } : null}
+              columns={columns}
+              crs={crs}
+              geometryType={geometryType}
+              rowCount={rowCount}
+              validCount={validCount}
+              invalidCount={invalidCount}
+              error={schemaError}
+              loading={schemaLoading}
+              mapping={mapping}
+              onMappingChange={setMapping}
+              onPreview={handlePreview}
+              previewLoading={previewLoading}
+              previewColumns={previewColumns}
+              previewRows={previewRows}
+              previewError={previewError}
+              datasetName={datasetName}
+              onDatasetNameChange={setDatasetName}
+              onRunPipeline={handleRunPipeline}
+              pipelineLoading={pipelineLoading}
+              pipelineResult={pipelineResult}
+            />
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

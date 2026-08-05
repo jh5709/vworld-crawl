@@ -1,0 +1,6 @@
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.32.0
+duckdb>=1.5.2
+duckle>=0.5.9,<0.6
+httpx>=0.28.0
+beautifulsoup4>=4.12.0

@@ -6,6 +6,7 @@ dist/
 .env
 *.ducklake
 vworld_data/
+catalog/
 *.zip
 *.shp
 *.dbf
