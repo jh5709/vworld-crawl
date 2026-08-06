@@ -172,6 +172,34 @@ from ducklake_console import (
     expire_snapshots,
 )
 
+# --- Crawler imports ---
+from crawler.session import CrawlSession
+from crawler.discover import (
+    DiscoveredFile,
+    DiscoveryResult,
+    DiscoveryState,
+    discover_files,
+    discover_all_pages,
+    DEFAULT_SELECTORS,
+)
+from crawler.download import (
+    DownloadFile,
+    DownloadProgress,
+    DownloadState,
+    run_download_queue,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_DOWNLOAD_DIR,
+)
+from crawler.state import CrawlEntry, upsert_entry, link_to_dataset, get_entries_by_dataset, cleanup_source_files, get_staged_entries, delete_staged_files
+
+# Module-level crawler state (single-user app)
+import concurrent.futures
+_crawler_session: CrawlSession | None = None
+_discovery_state: DiscoveryState | None = None
+_discovery_thread_future: "concurrent.futures.Future | None" = None
+_download_state: DownloadState | None = None
+_download_dir: str = os.path.join(os.path.dirname(__file__), DEFAULT_DOWNLOAD_DIR)
+
 
 class PipelineRequest(BaseModel):
     paths: list[str]
@@ -193,6 +221,13 @@ async def api_run_pipeline(req: PipelineRequest):
 
         if result.error:
             return {"success": False, "error": result.error}
+
+        # Link downloaded source files to this dataset (for cleanup/re-download)
+        for path in req.paths:
+            try:
+                link_to_dataset(path, req.dataset_name)
+            except Exception:
+                pass
 
         # Run post-crawl operations if rows were loaded (non-fatal)
         if result.rows_loaded > 0:
@@ -294,6 +329,13 @@ async def ws_pipeline(ws: WebSocket):
                 post_crawl_compact(result.dataset)
             except Exception as e:
                 logger.warning("Post-crawl error (non-fatal): %s", e)
+
+        # Link downloaded source files to dataset
+        for path in paths:
+            try:
+                link_to_dataset(path, dataset_name)
+            except Exception:
+                pass
         
         # Send completion
         await ws.send_text(_json.dumps({
@@ -371,6 +413,28 @@ async def api_table_snapshots(table_name: str):
     return {"snapshots": table_snapshots(table_name)}
 
 
+@app.get("/api/tables/{table_name}/sources")
+async def api_table_sources(table_name: str):
+    """Get source files linked to a DuckLake table (from crawl_state)."""
+    entries = get_entries_by_dataset(table_name)
+    return {
+        "table": table_name,
+        "sources": [
+            {
+                "url": e.url,
+                "file_name": e.file_name,
+                "etag": e.etag,
+                "last_modified": e.last_modified,
+                "file_size": e.file_size,
+                "downloaded_at": e.downloaded_at,
+                "status": e.status,
+                "local_path": e.local_path,
+            }
+            for e in entries
+        ],
+    }
+
+
 @app.post("/api/tables/{table_name}/compact")
 async def api_compact_table(table_name: str):
     """Compact a table by merging adjacent files."""
@@ -390,6 +454,527 @@ async def api_expire_snapshots(days: int = 30, dry_run: bool = False):
     dry_run=true previews what would be expired without changing anything.
     """
     return expire_snapshots(days, dry_run)
+
+
+# ---------------------------------------------------------------------------
+# Crawler Endpoints
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    host: str = ""
+    username: str = ""
+    password: str = ""
+    login_url: str = ""
+    target_url: str = ""
+    auth_required: bool = True  # False = public/no-auth mode
+
+
+class DiscoverRequest(BaseModel):
+    auto: bool = True
+    page_url: str = ""
+
+
+class DownloadRequest(BaseModel):
+    files: list[dict]
+    batch_size: int = DEFAULT_BATCH_SIZE
+    download_dir: str = ""
+
+
+@app.post("/api/crawler/login")
+async def api_crawler_login(req: LoginRequest):
+    """Authenticate to VWorld (or create a public session) and store it."""
+    global _crawler_session, _discovery_state, _download_state
+
+    try:
+        password = req.password or os.getenv("VWORLD_PASSWORD", "")
+        host = req.host or os.getenv("VWORLD_URL", "")
+        username = req.username or os.getenv("VWORLD_USERNAME", "")
+
+        if req.auth_required and (not host or not username or not password):
+            return {"success": False, "error": "Host, username, and password are required."}
+
+        session = CrawlSession(
+            host=host,
+            username=username,
+            password=password,
+            auth_required=req.auth_required,
+        )
+
+        if req.auth_required:
+            login_url = req.login_url or None
+            target_url = req.target_url or None
+            success = session.login(login_url=login_url, target_url=target_url)
+        else:
+            session._connect()
+            success = True
+
+        if success:
+            _crawler_session = session
+            _discovery_state = None
+            _download_state = None
+            return {"success": True, "message": "Session ready", "authenticated": session.authenticated}
+        else:
+            session.close()
+            return {"success": False, "error": "Login failed — check credentials and URL"}
+    except Exception as e:
+        logger.exception("Crawler login error")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/crawler/session-status")
+async def api_crawler_session_status():
+    """Check if the crawler session is active."""
+    global _crawler_session
+
+    if _crawler_session is None:
+        return {"authenticated": False, "host": "", "session_active": False}
+
+    try:
+        alive = _crawler_session.check_session()
+        return {
+            "authenticated": alive,
+            "host": _crawler_session.host if alive else "",
+            "session_active": alive,
+        }
+    except Exception:
+        return {"authenticated": False, "host": "", "session_active": False}
+
+
+@app.post("/api/crawler/logout")
+async def api_crawler_logout():
+    """Clear the crawler session."""
+    global _crawler_session, _discovery_state, _download_state
+
+    if _crawler_session:
+        _crawler_session.close()
+        _crawler_session = None
+    _discovery_state = None
+    _download_state = None
+    return {"success": True}
+
+
+@app.post("/api/crawler/discover")
+async def api_crawler_discover(req: DiscoverRequest):
+    """Discover downloadable files. Runs in a background thread so the
+    event loop stays responsive and Stop can work."""
+    global _crawler_session, _discovery_state, _discovery_thread_future
+
+    if _crawler_session is None:
+        return {"success": False, "error": "Not connected. Please create a session first."}
+
+    if not _crawler_session.ensure_session():
+        return {"success": False, "error": "Session expired and re-auth failed."}
+
+    import concurrent.futures
+
+    page_url = req.page_url or f"{_crawler_session.host}/data/download" if _crawler_session.host else req.page_url
+
+    if req.auto:
+        _discovery_state = DiscoveryState(page_url=page_url)
+
+        def run_auto():
+            return discover_all_pages(_crawler_session, page_url, state=_discovery_state)
+
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            _discovery_thread_future = pool.submit(run_auto)
+            result = await asyncio.wrap_future(_discovery_thread_future)
+            _discovery_thread_future = None
+    else:
+        # Manual: fetch one page, advancing the stored state
+        if _discovery_state is None:
+            _discovery_state = DiscoveryState(page_url=page_url)
+            fetch_url = page_url
+        else:
+            fetch_url = _discovery_state.next_page_url or page_url
+
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            _discovery_thread_future = pool.submit(
+                discover_files, _crawler_session, fetch_url, DEFAULT_SELECTORS, _discovery_state
+            )
+            result = await asyncio.wrap_future(_discovery_thread_future)
+            _discovery_thread_future = None
+
+        if not result.error and result.next_page_url:
+            _discovery_state.next_page_url = result.next_page_url
+            _discovery_state.current_page += 1
+
+    return {
+        "success": result.error != "stopped",
+        "stopped": result.error == "stopped",
+        "files": [
+            {
+                "name": f.name, "url": f.url, "size": f.size,
+                "size_str": f.size_str, "date": f.date,
+                "description": f.description, "etag": f.etag,
+                "last_modified": f.last_modified,
+            }
+            for f in result.files
+        ],
+        "current_page": result.current_page,
+        "total_pages": result.total_pages,
+        "has_next": result.has_next,
+        "error": result.error if result.error and result.error != "stopped" else None,
+    }
+
+
+@app.post("/api/crawler/discover/stop")
+async def api_crawler_discover_stop():
+    """Stop an ongoing auto-discovery."""
+    global _discovery_state, _discovery_thread_future
+    if _discovery_state:
+        _discovery_state.stopped = True
+    if _discovery_thread_future:
+        _discovery_thread_future.cancel()
+    return {"success": True}
+
+
+@app.post("/api/crawler/download")
+async def api_crawler_download(req: DownloadRequest):
+    """Start a download queue. For real-time progress, use the WebSocket endpoint.
+    This endpoint waits for completion and returns final results."""
+    global _crawler_session, _download_state, _download_dir
+
+    if _crawler_session is None:
+        return {"success": False, "error": "Not connected."}
+    if not req.files:
+        return {"success": False, "error": "No files selected."}
+
+    dir_path = req.download_dir or _download_dir
+    os.makedirs(dir_path, exist_ok=True)
+
+    if not _crawler_session.ensure_session():
+        return {"success": False, "error": "Session expired."}
+
+    import concurrent.futures
+
+    _download_state = DownloadState(
+        files=[DownloadFile(name=f["name"], url=f["url"]) for f in req.files],
+        batch_size=req.batch_size,
+        download_dir=dir_path,
+    )
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        future = pool.submit(
+            run_download_queue,
+            _crawler_session, req.files,
+            download_dir=dir_path,
+            batch_size=req.batch_size,
+            state=_download_state,
+        )
+        state = await asyncio.wrap_future(future)
+
+    _persist_download_state(state)
+
+    completed = sum(1 for f in state.files if f.status == "done")
+    failed = sum(1 for f in state.files if f.status == "failed")
+    stopped = sum(1 for f in state.files if f.status == "stopped")
+
+    return {
+        "success": True,
+        "completed": completed, "failed": failed, "stopped": stopped,
+        "total": len(state.files), "download_dir": dir_path,
+        "files": [
+            {"name": f.name, "status": f.status,
+             "local_path": f.local_path, "size": f.size, "error": f.error}
+            for f in state.files
+        ],
+    }
+
+
+def _persist_download_state(state: DownloadState):
+    """Persist completed downloads to crawl_state."""
+    for f in state.files:
+        if f.status == "done":
+            try:
+                upsert_entry(CrawlEntry(
+                    url=f.url, file_name=f.name,
+                    etag=f.etag, last_modified=f.last_modified,
+                    file_size=f.size, status=f.status, local_path=f.local_path,
+                ))
+            except Exception as e:
+                logger.warning("Failed to persist crawl state for %s: %s", f.name, e)
+
+
+@app.post("/api/crawler/download/stop")
+async def api_crawler_download_stop():
+    """Stop an ongoing download queue."""
+    global _download_state
+    if _download_state:
+        _download_state.stopped = True
+    return {"success": True}
+
+
+@app.websocket("/ws/crawler/download")
+async def ws_crawler_download(ws: WebSocket):
+    """WebSocket endpoint for real-time download progress."""
+    import json as _json
+
+    await ws.accept()
+
+    global _crawler_session, _download_state, _download_dir
+
+    try:
+        raw = await ws.receive_text()
+        params = _json.loads(raw)
+
+        files = params.get("files", [])
+        batch_size = params.get("batch_size", DEFAULT_BATCH_SIZE)
+        dir_path = params.get("download_dir", _download_dir)
+
+        if not files:
+            await ws.send_text(_json.dumps({"type": "error", "error": "No files selected."}))
+            await ws.close()
+            return
+
+        if _crawler_session is None:
+            await ws.send_text(_json.dumps({"type": "error", "error": "Not connected."}))
+            await ws.close()
+            return
+
+        os.makedirs(dir_path, exist_ok=True)
+
+        # Create a fresh download state so Stop works
+        _download_state = DownloadState(
+            files=[DownloadFile(name=f["name"], url=f["url"]) for f in files],
+            batch_size=batch_size,
+            download_dir=dir_path,
+        )
+
+        loop = asyncio.get_running_loop()
+
+        def send_progress(progress: DownloadProgress):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ws.send_text(_json.dumps({
+                        "type": "progress",
+                        "phase": progress.phase,
+                        "active_count": progress.active_count,
+                        "completed_count": progress.completed_count,
+                        "failed_count": progress.failed_count,
+                        "total_count": progress.total_count,
+                        "files": progress.files,
+                    }, default=str)),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        def run_in_thread():
+            return run_download_queue(
+                _crawler_session, files,
+                download_dir=dir_path,
+                batch_size=batch_size,
+                progress_callback=send_progress,
+                state=_download_state,
+            )
+
+        await ws.send_text(_json.dumps({
+            "type": "start", "total_files": len(files), "batch_size": batch_size,
+        }))
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(run_in_thread)
+            state = await asyncio.wrap_future(future)
+
+        _persist_download_state(state)
+
+        completed = sum(1 for f in state.files if f.status == "done")
+        failed = sum(1 for f in state.files if f.status == "failed")
+        stopped = sum(1 for f in state.files if f.status == "stopped")
+
+        await ws.send_text(_json.dumps({
+            "type": "complete",
+            "completed": completed, "failed": failed, "stopped": stopped,
+            "total": len(state.files), "download_dir": dir_path,
+            "files": [
+                {"name": f.name, "status": f.status,
+                 "local_path": f.local_path, "size": f.size, "error": f.error}
+                for f in state.files
+            ],
+        }))
+
+    except WebSocketDisconnect:
+        logger.info("Crawler WebSocket disconnected")
+    except Exception as e:
+        logger.exception("Crawler WebSocket error")
+        try:
+            await ws.send_text(_json.dumps({"type": "error", "error": str(e)}))
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/crawler/download-dir")
+async def api_pick_download_dir():
+    """Open a native folder picker to choose the download directory."""
+    global _download_dir
+    import subprocess
+
+    for cmd in [
+        ["zenity", "--file-selection", "--directory", "--title=Select Download Directory"],
+        ["kdialog", "--getexistingdirectory"],
+    ]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                path = result.stdout.strip()
+                _download_dir = path
+                return {"path": path}
+        except Exception:
+            continue
+
+    return {"path": _download_dir, "error": "No folder picker available. Type the path manually."}
+
+
+@app.get("/api/crawler/staged")
+async def api_crawler_staged():
+    """Download staging summary: originals on disk + those not yet loaded into a table."""
+    def size_of(e: CrawlEntry) -> int:
+        try:
+            return os.path.getsize(e.local_path)
+        except OSError:
+            return e.file_size
+
+    entries = get_staged_entries()
+    not_loaded = [e for e in entries if not e.dataset_name]
+    return {
+        "total_files": len(entries),
+        "total_size": sum(size_of(e) for e in entries),
+        "not_loaded": [
+            {
+                "url": e.url,
+                "file_name": e.file_name,
+                "file_size": size_of(e),
+                "local_path": e.local_path,
+                "downloaded_at": e.downloaded_at,
+            }
+            for e in not_loaded
+        ],
+    }
+
+
+class StagedDeleteRequest(BaseModel):
+    urls: list[str]
+
+
+@app.post("/api/crawler/staged/delete")
+async def api_crawler_staged_delete(req: StagedDeleteRequest):
+    """Delete staged originals. crawl_state rows are kept with status 'cleaned'
+    so URLs/ETags survive for re-download and re-crawl change detection."""
+    try:
+        result = delete_staged_files(req.urls)
+        return {
+            "success": True,
+            "deleted": result["deleted"],
+            "failed": result["failed"],
+            "freed_bytes": result["freed_bytes"],
+            "message": f"Cleared {len(result['deleted'])} staged file(s), "
+                       f"freed {result['freed_bytes']:,} bytes.",
+        }
+    except Exception as e:
+        logger.exception("Staged delete failed")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/crawler/cleanup/{dataset_name}")
+async def api_crawler_cleanup(dataset_name: str):
+    """Delete source files linked to a DuckLake table after successful pipeline.
+
+    The DuckLake Parquet files remain untouched — only the downloaded
+    .geojson/.shp/.zip intermediate files are removed.
+    """
+    try:
+        result = cleanup_source_files(dataset_name)
+        return {
+            "success": True,
+            "dataset": dataset_name,
+            "deleted": result["deleted"],
+            "failed": result["failed"],
+            "freed_bytes": result["freed_bytes"],
+            "message": f"Cleared {len(result['deleted'])} staged original(s), "
+                       f"freed {result['freed_bytes']:,} bytes.",
+        }
+    except Exception as e:
+        logger.exception("Cleanup failed for %s", dataset_name)
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/crawler/redownload/{dataset_name}")
+async def api_crawler_redownload(dataset_name: str):
+    """Re-download source files for a dataset whose local copies were cleaned up.
+
+    Uses the URLs stored in crawl_state. Files go to the default download dir.
+    """
+    global _crawler_session, _download_dir
+
+    entries = get_entries_by_dataset(dataset_name)
+    if not entries:
+        return {"success": False, "error": f"No source files tracked for dataset '{dataset_name}'."}
+
+    # Filter to entries that still have a URL (not fully purged)
+    redownloadable = [e for e in entries if e.url and e.status == "cleaned"]
+    if not redownloadable:
+        return {"success": False, "error": f"No cleaned files to re-download for '{dataset_name}'. Files are still on disk or status is '{entries[0].status}'."}
+
+    import concurrent.futures
+
+    files = [{"name": e.file_name, "url": e.url} for e in redownloadable]
+
+    _download_state = DownloadState(
+        files=[DownloadFile(name=f["name"], url=f["url"]) for f in files],
+        batch_size=min(len(files), 5),
+        download_dir=str(_download_dir),
+    )
+
+    session = _crawler_session
+    if session is None:
+        # Create a public session for re-download
+        from crawler.session import CrawlSession
+        session = CrawlSession(auth_required=False)
+        session._connect()
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        future = pool.submit(
+            run_download_queue,
+            session, files,
+            download_dir=str(_download_dir),
+            batch_size=_download_state.batch_size,
+            state=_download_state,
+        )
+        state = await asyncio.wrap_future(future)
+
+    _persist_download_state(state)
+
+    completed = sum(1 for f in state.files if f.status == "done")
+    failed = sum(1 for f in state.files if f.status == "failed")
+
+    return {
+        "success": True,
+        "dataset": dataset_name,
+        "completed": completed,
+        "failed": failed,
+        "message": f"Re-downloaded {completed}/{len(files)} file(s) to {_download_dir}",
+    }
+
+
+@app.get("/api/crawler/env-credentials")
+async def api_crawler_env_credentials():
+    """Return any credentials set via environment variables for auto-fill."""
+    return {
+        "url": os.getenv("VWORLD_URL", ""),
+        "username": os.getenv("VWORLD_USERNAME", ""),
+        "password": "" if not os.getenv("VWORLD_PASSWORD") else "***",
+        "has_password": bool(os.getenv("VWORLD_PASSWORD")),
+    }
 
 
 # --- Static Files (React frontend) ---

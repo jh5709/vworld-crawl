@@ -163,10 +163,10 @@ export default function DirectoryPicker({ onScan, loading }: DirectoryPickerProp
           <div className="border-2 border-dashed border-neutral-800 rounded-lg p-6 text-center">
             <Globe className="w-8 h-8 mx-auto mb-2 text-neutral-700" />
             <p className="text-sm text-neutral-500">
-              Enter a VWorld URL to crawl
+              Remote crawling is now available in the <span className="text-emerald-400 font-medium">Crawler</span> tab
             </p>
             <p className="text-xs text-neutral-700 mt-1">
-              Remote crawling is coming in the Crawler module
+              Log in to VWorld, discover, and download files from the portal
             </p>
           </div>
         </>

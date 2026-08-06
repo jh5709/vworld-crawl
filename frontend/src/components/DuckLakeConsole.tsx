@@ -2,7 +2,33 @@ import { useState, useEffect } from "react";
 import {
   Database, RefreshCw, HardDrive, Trash2, Clock,
   AlertTriangle, ChevronRight, Eye, Info,
+  Download, FileArchive,
 } from "lucide-react";
+
+interface CrawlSourceFile {
+  url: string;
+  file_name: string;
+  etag: string;
+  last_modified: string;
+  file_size: number;
+  local_path: string;
+  status: string;
+  downloaded_at: string;
+}
+
+interface StagedFile {
+  url: string;
+  file_name: string;
+  file_size: number;
+  local_path: string;
+  downloaded_at: string;
+}
+
+interface StagedSummary {
+  total_files: number;
+  total_size: number;
+  not_loaded: StagedFile[];
+}
 
 interface TableInfo {
   name: string;
@@ -53,7 +79,11 @@ function formatDate(ts: string | null): string {
   }
 }
 
-export default function DuckLakeConsole() {
+export default function DuckLakeConsole({
+  onLoadToPipeline,
+}: {
+  onLoadToPipeline?: (filePath: string) => void;
+}) {
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
@@ -64,6 +94,28 @@ export default function DuckLakeConsole() {
   const [days, setDays] = useState(30);
   const [expirePreview, setExpirePreview] = useState<ExpirePreview | null>(null);
   const [preview, setPreview] = useState<PreviewData | null>(null);
+
+  // --- Source files (crawl_state linkage) ---
+  const [sourceFiles, setSourceFiles] = useState<CrawlSourceFile[]>([]);
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [cleaningUp, setCleaningUp] = useState<string | null>(null);
+  const [redownloading, setRedownloading] = useState<string | null>(null);
+
+  // --- Download staging (originals on disk) ---
+  const [staged, setStaged] = useState<StagedSummary | null>(null);
+  const [deletingStaged, setDeletingStaged] = useState(false);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+
+  const fetchStaged = async () => {
+    try {
+      const res = await fetch("/api/crawler/staged");
+      if (!res.ok) return; // older backend without staging endpoints
+      setStaged(await res.json());
+    } catch {
+      /* backend unreachable — staging section stays hidden */
+    }
+  };
 
   const fetchTables = async () => {
     setLoading(true);
@@ -76,6 +128,7 @@ export default function DuckLakeConsole() {
     } finally {
       setLoading(false);
     }
+    fetchStaged();
   };
 
   useEffect(() => { fetchTables(); }, []);
@@ -83,19 +136,97 @@ export default function DuckLakeConsole() {
   const fetchSnapshots = async (name: string) => {
     if (selectedTable === name) {
       setSelectedTable(null);
+      setSourceFiles([]);
       return;
     }
     setSelectedTable(name);
     setSnapLoading(true);
+    setSourceLoading(true);
+    setSourceError(null);
     setOpResult(null);
+    // Fetch snapshots and sources independently — a sources failure
+    // (e.g. stale backend without the endpoint) must not hide snapshots.
     try {
-      const res = await fetch(`/api/tables/${encodeURIComponent(name)}/snapshots`);
-      const data = await res.json();
-      setSnapshots(data.snapshots || []);
+      const snapRes = await fetch(`/api/tables/${encodeURIComponent(name)}/snapshots`);
+      const snapData = await snapRes.json();
+      setSnapshots(snapData.snapshots || []);
     } catch (e) {
       console.error(e);
     } finally {
       setSnapLoading(false);
+    }
+    try {
+      const srcRes = await fetch(`/api/tables/${encodeURIComponent(name)}/sources`);
+      if (!srcRes.ok) throw new Error(`HTTP ${srcRes.status} — restart the backend?`);
+      const srcData = await srcRes.json();
+      setSourceFiles(srcData.sources || []);
+    } catch (e: any) {
+      console.error(e);
+      setSourceFiles([]);
+      setSourceError(e.message || "Failed to load source files");
+    } finally {
+      setSourceLoading(false);
+    }
+  };
+
+  const handleDeleteStaged = async (urls: string[]) => {
+    setDeletingStaged(true);
+    setOpResult(null);
+    try {
+      const res = await fetch("/api/crawler/staged/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls }),
+      });
+      const data = await res.json();
+      setOpResult(data);
+      if (data.success) fetchStaged();
+    } catch (e: any) {
+      setOpResult({ success: false, error: e.message });
+    } finally {
+      setDeletingStaged(false);
+      setConfirmDeleteAll(false);
+    }
+  };
+
+  const handleCleanup = async (tableName: string) => {
+    setCleaningUp(tableName);
+    setOpResult(null);
+    try {
+      const res = await fetch(`/api/crawler/cleanup/${encodeURIComponent(tableName)}`, { method: "POST" });
+      const data = await res.json();
+      setOpResult(data);
+      if (data.success) {
+        // Refresh source file list
+        const srcRes = await fetch(`/api/tables/${encodeURIComponent(tableName)}/sources`);
+        const srcData = await srcRes.json();
+        setSourceFiles(srcData.sources || []);
+        fetchTables();
+      }
+    } catch (e: any) {
+      setOpResult({ success: false, error: e.message });
+    } finally {
+      setCleaningUp(null);
+    }
+  };
+
+  const handleRedownload = async (tableName: string) => {
+    setRedownloading(tableName);
+    setOpResult(null);
+    try {
+      const res = await fetch(`/api/crawler/redownload/${encodeURIComponent(tableName)}`, { method: "POST" });
+      const data = await res.json();
+      setOpResult(data);
+      if (data.success) {
+        const srcRes = await fetch(`/api/tables/${encodeURIComponent(tableName)}/sources`);
+        const srcData = await srcRes.json();
+        setSourceFiles(srcData.sources || []);
+        fetchStaged();
+      }
+    } catch (e: any) {
+      setOpResult({ success: false, error: e.message });
+    } finally {
+      setRedownloading(null);
     }
   };
 
@@ -290,6 +421,73 @@ export default function DuckLakeConsole() {
                 ) : (
                   <span className="text-xs text-neutral-600">No snapshot history</span>
                 )}
+
+                {/* Source files section */}
+                {sourceError && (
+                  <div className="mt-3 pt-3 border-t border-neutral-800/50 text-[11px] text-red-400">
+                    Source files unavailable: {sourceError}
+                  </div>
+                )}
+                {!sourceLoading && !sourceError && sourceFiles.length > 0 && (
+                  <div className="mt-3 pt-3 border-t border-neutral-800/50">
+                    <div className="flex items-center gap-2 text-[11px] text-neutral-600 mb-2">
+                      <FileArchive className="w-3 h-3" />
+                      <span>Originals in staging — {sourceFiles.length} file{sourceFiles.length !== 1 ? "s" : ""}</span>
+                      {sourceFiles.some((f) => f.status === "cleaned") && (
+                        <span className="text-amber-500">
+                          ({sourceFiles.filter((f) => f.status === "cleaned").length} cleared)
+                        </span>
+                      )}
+                    </div>
+                    {sourceFiles.slice(0, 5).map((sf) => (
+                      <div key={sf.url} className="flex items-center gap-2 text-[11px]">
+                        <span
+                          className={`w-2 h-2 rounded-full shrink-0 ${
+                          sf.status === "done" ? "bg-emerald-500"
+                          : sf.status === "cleaned" ? "bg-amber-500"
+                          : "bg-neutral-600"
+                        }`}
+                          title={sf.status === "done"
+                            ? "Loaded — original in staging"
+                            : sf.status === "cleaned"
+                              ? "Cleared — deleted from staging"
+                              : sf.status}
+                        />
+                        <span className="text-neutral-400 truncate flex-1" title={sf.url}>
+                          {sf.file_name}
+                        </span>
+                        <span className="text-neutral-600">{formatSize(sf.file_size)}</span>
+                      </div>
+                    ))}
+                    {sourceFiles.length > 5 && (
+                      <span className="text-[11px] text-neutral-700">
+                        +{sourceFiles.length - 5} more
+                      </span>
+                    )}
+                    <div className="flex gap-1.5 mt-2">
+                      {sourceFiles.some((f) => f.status === "done") && (
+                        <button
+                          onClick={() => handleCleanup(t.name)}
+                          disabled={cleaningUp === t.name}
+                          className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-amber-400 hover:text-amber-300 hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          {cleaningUp === t.name ? "Clearing..." : "Clear staging"}
+                        </button>
+                      )}
+                      {sourceFiles.some((f) => f.status === "cleaned") && (
+                        <button
+                          onClick={() => handleRedownload(t.name)}
+                          disabled={redownloading === t.name}
+                          className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-blue-400 hover:text-blue-300 hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                        >
+                          <Download className="w-3 h-3" />
+                          {redownloading === t.name ? "Downloading..." : "Re-download"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -315,6 +513,84 @@ export default function DuckLakeConsole() {
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Download staging */}
+      {staged && staged.total_files > 0 && (
+        <div className="border border-neutral-800 rounded-lg overflow-hidden">
+          <div className="px-3 py-2 text-[11px] uppercase tracking-wider text-neutral-600 bg-neutral-900/50 border-b border-neutral-800 flex items-center gap-2">
+            <FileArchive className="w-3 h-3 text-neutral-500" />
+            <span>
+              Download staging — {staged.total_files} file{staged.total_files !== 1 ? "s" : ""}," "
+              {formatSize(staged.total_size)}
+            </span>
+          </div>
+          {staged.not_loaded.length > 0 && (
+            <div className="px-3 py-2 space-y-1">
+              <div className="text-[11px] text-neutral-600 mb-1">
+                Not yet loaded — {staged.not_loaded.length} file{staged.not_loaded.length !== 1 ? "s" : ""}
+              </div>
+              {staged.not_loaded.map((f) => (
+                <div key={f.url} className="flex items-center gap-2 text-[11px]">
+                  <span className="w-2 h-2 rounded-full shrink-0 bg-neutral-500"
+                    title="Staged — not loaded into any table" />
+                  <span className="text-neutral-400 truncate flex-1" title={f.local_path}>
+                    {f.file_name}
+                  </span>
+                  <span className="text-neutral-600">{formatSize(f.file_size)}</span>
+                  {onLoadToPipeline && (
+                    <button
+                      onClick={() => onLoadToPipeline(f.local_path)}
+                      className="px-2 py-0.5 text-[11px] text-emerald-400 hover:text-emerald-300 hover:bg-neutral-800 rounded transition-colors"
+                      title="Scan this file's directory into the pipeline"
+                    >
+                      Load into table…
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleDeleteStaged([f.url])}
+                    disabled={deletingStaged}
+                    className="px-2 py-0.5 text-[11px] text-red-400/80 hover:text-red-300 hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                    title="Delete from staging (keeps URL for re-crawl)"
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+              <div className="pt-1.5 flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    if (confirmDeleteAll) {
+                      handleDeleteStaged(staged.not_loaded.map((f) => f.url));
+                    } else {
+                      setConfirmDeleteAll(true);
+                    }
+                  }}
+                  disabled={deletingStaged}
+                  className={`px-2 py-0.5 text-[11px] rounded transition-colors disabled:opacity-40 ${
+                    confirmDeleteAll
+                      ? "text-red-300 bg-red-500/10 border border-red-500/30"
+                      : "text-red-400/80 hover:text-red-300 hover:bg-neutral-800"
+                  }`}
+                >
+                  {deletingStaged
+                    ? "Deleting..."
+                    : confirmDeleteAll
+                      ? `Confirm delete ${staged.not_loaded.length} file${staged.not_loaded.length !== 1 ? "s" : ""}?`
+                      : "Delete all staged"}
+                </button>
+                {confirmDeleteAll && !deletingStaged && (
+                  <button
+                    onClick={() => setConfirmDeleteAll(false)}
+                    className="px-2 py-0.5 text-[11px] text-neutral-500 hover:text-neutral-300 rounded transition-colors"
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

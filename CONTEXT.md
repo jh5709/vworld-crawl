@@ -74,8 +74,24 @@ _Avoid_: GIS viewer, map client
 
 ## Crawler Concepts
 
+**Crawl session**:
+An HTTP session to a geospatial data portal. Two modes: **login** (authenticated — stores encrypted credentials in memory, re-auths on expiry) and **public** (no-auth — connects to public data catalogues like geojson.xyz or data.nextgis.com). Managed by `CrawlSession` in `backend/crawler/session.py`.
+_Avoid_: Connection, client
+
+**Public mode**:
+No-authentication discovery for public data catalogues. The user enters a URL (no credentials) and clicks Connect. The crawler uses a plain httpx client with no login step. Introduced in #39 to enable testing and non-VWorld sources.
+_Avoid_: Anonymous, guest
+
+**Connected**:
+Generic session state — either authenticated (login mode) or ready (public mode). The GUI shows a green shield with "Connected" or "Authenticated". Session status is polled every 30 seconds.
+_Avoid_: Logged in, active
+
+**Respectful crawling**:
+Policies to minimize server impact: browser-like User-Agent (Chrome/Linux), randomized 1–3s delays between page requests, and robots.txt honored (disallowed URLs are refused, not just warned). Crawl-Delay from robots.txt is applied when specified. Managed by `backend/crawler/respect.py`.
+_Avoid_: Rate limiting, throttling
+
 **Batch size**:
-Maximum number of concurrent file downloads. User-configurable in the GUI (default: 5). Respects VWorld server resources and bounds memory usage.
+Maximum number of concurrent file downloads. User-configurable in the GUI (default: 5 for portals, 3 for testing). Respects VWorld server resources and bounds memory usage.
 _Avoid_: Concurrency limit, pool size
 
 **Queue**:
@@ -83,16 +99,45 @@ The ordered list of selected files awaiting download. Files beyond the batch siz
 _Avoid_: Backlog, pending
 
 **Auto-pagination**:
-Discovery mode that walks all pages automatically until exhausted, streaming progress to the GUI ("Page 3 of 17").
+Discovery mode that walks all pages automatically until exhausted, streaming progress to the GUI ("Page 3 of 17"). Discovery runs in a background thread (ThreadPoolExecutor) so the event loop stays responsive and Stop works. Limited to 100 pages max with visited-URL tracking to prevent infinite loops.
 _Avoid_: Full scan, auto-walk
 
 **Manual pagination**:
-Discovery mode where the user clicks "Next Page" to control pace. Useful for inspecting page contents before proceeding.
+Discovery mode where the user clicks "Next Page" to advance. Each click fetches one page; accumulated files persist across pages. Uses a stored DiscoveryState for page tracking.
 _Avoid_: Step mode, page-by-page
 
 **Crawl state**:
-Persistent record of last-known file URLs, ETags, and Last-Modified timestamps. Used to detect changed files on re-crawl. Stored in a `crawl_state` DuckDB table.
+Persistent record of last-known file URLs, ETags, and Last-Modified timestamps per downloaded file. Stored in the plain DuckDB catalog (`catalog/vworld_catalog.db`) — NOT in DuckLake — since this is app metadata, not lakehouse data. Uses DELETE + INSERT (DuckLake does not support PRIMARY KEY or INSERT OR REPLACE). Checked on re-crawl to detect changed files. Managed by `backend/crawler/state.py`.
 _Avoid_: Catalog, registry
+
+**Sanitized filename**:
+Remote file names are sanitized before writing to disk to prevent path traversal attacks (e.g., `../../etc/passwd`). Directory components and `..` are stripped; only the basename is kept. Applied automatically by `_sanitize_filename()` in `backend/crawler/download.py`.
+
+**Download progress**:
+Per-file progress streamed via WebSocket during batch downloads. Each file reports: status (queued/downloading/done/failed/stopped), progress (0.0–1.0, or null for indeterminate unknown-size files), downloaded bytes, local path, ETag, and Last-Modified. The GUI renders progress bars with percentage labels; indeterminate files show an animated pulse bar with "...".
+
+**Crawler stop**:
+Both discovery and download support cancellation. Discovery stop sets a flag checked between pages (with future cancellation for thread-based runs). Download stop sets a flag checked per chunk (64KB). Stopped operations preserve accumulated files and completed downloads.
+
+**DuckLake storage**:
+The lakehouse proper — DuckLake tables, their Parquet data files, and snapshots. Permanent and queryable. Distinguished from download staging in the console's storage summary.
+_Avoid_: Database, lake
+
+**Download staging**:
+The crawler's download directory — a temporary holding area for original files before and after they are loaded into DuckLake storage. The DuckLake console shows a staging summary (file count, total size) and lists staged files not yet loaded into any table.
+_Avoid_: Inbox, temp dir
+
+**Staged**:
+A downloaded file in staging that no pipeline has consumed yet (crawl_state `dataset_name` is empty). Shown under "Not yet loaded" in the console with Load-into-table and Delete actions.
+_Avoid_: Unlinked, orphaned
+
+**Loaded**:
+A staged file that a pipeline has consumed into a DuckLake table. crawl_state attributes each file to the most recent table that consumed it (one file = one table). The original stays in staging until cleared.
+_Avoid_: Linked
+
+**Cleared**:
+A staged original deleted from disk (via Clear staging on a table, or Delete in the staging section). The crawl_state row is kept with status `cleaned` so the URL, ETag, and Last-Modified survive for re-download and re-crawl change detection.
+_Avoid_: Purged, cleaned up
 
 ## Encoding
 

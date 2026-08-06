@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Database, Layers } from "lucide-react";
 import DirectoryPicker from "@/components/DirectoryPicker";
+import CrawlerPanel from "@/components/CrawlerPanel";
 import DuckLakeConsole from "@/components/DuckLakeConsole";
 import FileGrid, { type FileEntry } from "@/components/FileGrid";
 import SchemaEditor, {
@@ -10,7 +11,7 @@ import SchemaEditor, {
 import { type NodeStatus } from "@/components/PipelineProgress";
 import { API, wsUrl } from "@/lib/api";
 
-type View = "picker" | "grid" | "schema" | "console";
+type View = "picker" | "crawler" | "grid" | "schema" | "console";
 
 export default function App() {
   // Directory scanning
@@ -217,6 +218,20 @@ export default function App() {
     };
   };
 
+  // --- Crawler file feed ---
+  const handleCrawlerFiles = (_downloadDir: string, dlFiles: { name: string; path: string }[]) => {
+    if (dlFiles.length > 0) {
+      // Feed downloaded files into the file grid by scanning the dir properly
+      const dir = dlFiles[0].path.substring(0, dlFiles[0].path.lastIndexOf("/"));
+      if (dir) handleScan(dir);
+    }
+  };
+
+  // --- Crawler -> scan directory ---
+  const handleCrawlerScanDir = (dir: string) => {
+    handleScan(dir);
+  };
+
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-50">
       {/* Header */}
@@ -260,13 +275,14 @@ export default function App() {
 
           {/* Nav tabs */}
           <div className="ml-auto flex items-center gap-1">
-            {(["picker", "grid", "schema", "console"] as const).map((v) => (
+            {(["picker", "crawler", "grid", "schema", "console"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => {
                   if (v === "grid" && files.length > 0) setView("grid");
                   else if (v === "schema" && inspectFile) setView("schema");
                   else if (v === "console") setView("console");
+                  else if (v === "crawler") setView("crawler");
                   else setView("picker");
                 }}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
@@ -275,7 +291,7 @@ export default function App() {
                     : "text-neutral-600 hover:text-neutral-400"
                 }`}
               >
-                {v === "picker" ? "Source" : v === "grid" ? "Files" : v === "schema" ? "Schema" : "Console"}
+                {v === "picker" ? "Local" : v === "crawler" ? "Crawler" : v === "grid" ? "Files" : v === "schema" ? "Schema" : "Console"}
               </button>
             ))}
           </div>
@@ -285,7 +301,21 @@ export default function App() {
       {/* Body */}
       <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
         {view === "picker" && (
-          <DirectoryPicker onScan={handleScan} loading={scanLoading} />
+          <>
+            <DirectoryPicker onScan={handleScan} loading={scanLoading} />
+            <div className="mt-4 p-3 rounded-lg border border-neutral-800 bg-neutral-900/30 text-center">
+              <button
+                onClick={() => setView("crawler")}
+                className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+              >
+                Or use the <span className="text-emerald-400 font-medium">Crawler</span> to download files from VWorld portal →
+              </button>
+            </div>
+          </>
+        )}
+
+        {view === "crawler" && (
+          <CrawlerPanel onFilesDownloaded={handleCrawlerFiles} onScanDir={handleCrawlerScanDir} />
         )}
 
         {view === "grid" && (
@@ -353,7 +383,15 @@ export default function App() {
           </div>
         )}
 
-        {view === "console" && <DuckLakeConsole />}
+        {view === "console" && (
+          <DuckLakeConsole
+            onLoadToPipeline={(filePath) => {
+              // Scan the staged file's directory into the File Grid
+              const dir = filePath.slice(0, filePath.lastIndexOf("/")) || filePath;
+              handleScan(dir);
+            }}
+          />
+        )}
       </main>
     </div>
   );

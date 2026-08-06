@@ -10,9 +10,10 @@
 │                                                                   │
 │  ┌─────────────┐  ┌───────────────┐  ┌────────────────────────┐  │
 │  │ Crawler     │  │ Schema Editor │  │ DuckLake Console       │  │
-│  │ Discovery   │  │ (rename/drop  │  │ Tables, snapshots,     │  │
-│  │ + Download  │  │  columns)     │  │ compact, reindex,      │  │
-│  │ + Queue     │  │               │  │ compact, expire         │  │
+│  │ Login/Public│  │ (rename/drop  │  │ Tables, snapshots,     │  │
+│  │ Discovery   │  │  columns)     │  │ compact, reindex,      │  │
+│  │ + Download  │  │               │  │ expire                  │  │
+│  │ + Queue     │  │               │  │                        │  │
 │  └─────────────┘  └───────────────┘  └────────────────────────┘  │
 │       │                  │                      │                 │
 │       └──────────────────┼──────────────────────┘                 │
@@ -24,25 +25,41 @@
 │                                                                   │
 │  ┌──────────────┐   ┌─────────────────────────────────────────┐  │
 │  │ Crawler      │   │  Duckle Pipeline (duckle Python API)     │  │
-│  │ httpx + bs4  │   │                                         │  │
-│  │              │   │  src.spatial → xf.rename → xf.project   │  │
-│  │ - Paginated  │   │    → qa.geomvalidate                    │  │
-│  │   discovery  │   │      → valid → snk.ducklake (append)   │  │
-│  │ - Batch dl   │   │      → reject → snk.ducklake (rejects) │  │
-│  │ - Queue mgmt │   │                                         │  │
-│  │ - Credentials│   │  + code.sql (WKB + bbox columns)        │  │
-│  │   via env    │   │                                         │  │
+│  │              │   │                                         │  │
+│  │ CrawlSession │   │  src.spatial → xf.rename → xf.project   │  │
+│  │  - login     │   │    → qa.geomvalidate                    │  │
+│  │  - public    │   │      → valid → snk.ducklake (append)   │  │
+│  │  - re-auth   │   │      → reject → snk.ducklake (rejects) │  │
+│  │              │   │                                         │  │
+│  │ Discover     │   │  + code.sql (WKB + bbox columns)        │  │
+│  │  - auto mode │   │                                         │  │
+│  │  - manual    │   │                                         │  │
+│  │  - stoppable │   │                                         │  │
+│  │  - threaded  │   │                                         │  │
+│  │              │   │                                         │  │
+│  │ Download     │   │                                         │  │
+│  │  - batched   │   │                                         │  │
+│  │  - progress  │   │                                         │  │
+│  │  - stoppable │   │                                         │  │
+│  │  - ETag/LM   │   │                                         │  │
+│  │              │   │                                         │  │
+│  │ Respect      │   │                                         │  │
+│  │  - robots.txt│   │                                         │  │
+│  │  - delays    │   │                                         │  │
+│  │  - browser UA│   │                                         │  │
 │  └──────────────┘   └────────────────┬────────────────────────┘  │
 │                                      │                            │
 │  ┌───────────────────────────────────▼────────────────────────┐  │
-│  │              DuckDB + DuckLake (DuckDB catalog)             │  │
+│  │       DuckDB (plain catalog) + DuckLake (lakehouse)         │  │
 │  │                                                             │  │
-│  │  Tables:                                                     │  │
+│  │  catalog/vworld_catalog.db (DuckDB — app metadata):         │  │
+│  │   crawl_state  (URL/ETag/Last-Modified tracking)            │  │
+│  │                                                             │  │
+│  │  catalog/ducklake_metadata.ducklake (DuckLake — data):      │  │
 │  │   roads        (snapshots: v1=raw, v2=clean, ...)          │  │
 │  │   roads_rejects (geometry validation failures)              │  │
 │  │   buildings    (snapshots: v1=raw, v2=clean, ...)           │  │
 │  │   buildings_rejects                                         │  │
-│  │   crawl_state  (URL/ETag/Last-Modified tracking)            │  │
 │  │                                                             │  │
 │  │  Per-row: geom_wkb, bbox_xmin/ymin/xmax/ymax, data_date    │  │
 │  └─────────────────────────────────────────────────────────────┘  │
@@ -58,14 +75,31 @@
 ## 2. Data Flow
 
 ### 2.1 Discovery Phase
+
+Two entry paths — **public** (no credentials) and **login** (authenticated):
+
 ```
-User enters VWorld URL
+User chooses mode in GUI:
+  │
+  ├── [Public Access]  →  enter URL → CrawlSession(auth_required=False) → plain httpx.Client
+  │
+  └── [Login Required] →  enter URL + credentials → CrawlSession(auth_required=True) → POST login → cookie store
+                                   │
+                                   ▼
+                    Env var fallback: VWORLD_URL, VWORLD_USERNAME, VWORLD_PASSWORD
+```
+
+```
+User clicks Discover
          │
-         ▼
+         ▼ (runs in background thread — event loop stays responsive)
 ┌──────────────────────────────────────────┐
 │ Paginated walk (auto or manual)          │
-│ Page 1 → Page 2 → ... → Page N          │
-│ Accumulate file list with sizes          │
+│ Page 1 → Page 2 → ... → Page N (≤100)   │
+│ Visited-URL tracking prevents loops      │
+│ 1–3s randomized delay between pages      │
+│ robots.txt honored (disallowed → refuse) │
+│ Accumulate file list with sizes + ETag   │
 └──────────────────┬───────────────────────┘
                    │
                    ▼
@@ -161,14 +195,19 @@ Re-crawl discovery → Compare against crawl_state table
 
 ## 3. GUI Screens
 
-### Screen 1: Crawler Discovery & Download
-- URL input with credentials from env
+### Screen 1: Crawler Connect & Discovery
+- Public / Login mode toggle
+- URL input (public) or URL + credentials (login)
+- Env var auto-fill: VWORLD_URL, VWORLD_USERNAME, VWORLD_PASSWORD
+- Session status indicator: Connected (green) / Disconnected (grey)
+- 30-second session health polling
 - Pagination: "Page N of M" with auto/manual toggle + "Next Page"
 - File grid: checkbox, name, size, last-modified, status
-- Select All / Filter by name / Province grouping
-- Batch size selector (default 5)
-- Download queue with per-file progress bars
-- "Stop" to cancel mid-crawl
+- File names extracted from URL when link text is generic ("download")
+- Select All / Filter by name
+- Batch size selector (default 3)
+- Download queue with per-file progress bars (indeterminate for unknown-size)
+- "Stop" to cancel mid-crawl (both discovery and download)
 
 ### Screen 2: Schema Editor
 - Raw columns from shapefile (auto-detected)
@@ -241,28 +280,42 @@ vworld-crawl/
 │       ├── 0001-duckle-as-library.md
 │       ├── 0002-duckdb-catalog.md
 │       ├── 0003-one-table-per-dataset.md
-│       └── 0004-web-console-wails-viewer.md
+│       ├── 0004-web-console-wails-viewer.md
+│       └── 0005-crawler-architecture.md
 ├── backend/
-│   ├── main.py                    # FastAPI + WebSocket
+│   ├── main.py                    # FastAPI + WebSocket (all API + WS endpoints)
 │   ├── crawler/
-│   │   ├── discover.py            # Paginated link discovery
-│   │   ├── download.py            # Batched download with queue
-│   │   └── session.py             # Auth session (env credentials)
+│   │   ├── __init__.py
+│   │   ├── session.py             # CrawlSession (login + public mode, re-auth, cookie persistence)
+│   │   ├── discover.py            # Paginated link discovery (auto/manual, threaded, spatial-filtered)
+│   │   ├── download.py            # Batched download with queue, per-file progress, ETag capture
+│   │   ├── respect.py             # robots.txt honoring, browser UA, randomized delays
+│   │   └── state.py               # Crawl state persistence in plain DuckDB catalog
 │   ├── pipeline/
-│   │   └── runner.py              # Duckle pipeline builder (thin abstraction)
-│   ├── ducklake/
-│   │   └── ops.py                 # Compact, rewrite, snapshot expiry
-│   └── ws/
-│       └── progress.py            # WebSocket progress streaming
+│   │   ├── __init__.py
+│   │   ├── runner.py              # Duckle pipeline builder (thin abstraction)
+│   │   └── progress.py            # Pipeline progress parser
+│   ├── db.py                      # Shared DuckDB connection helper
+│   ├── catalog.py                 # Catalog abstraction (DuckDB | PostgreSQL)
+│   ├── ducklake_ops.py            # DuckLake extension setup + ATTACH
+│   ├── ducklake_console.py        # Table list, snapshots, compact, reindex, expire
+│   ├── schema_detector.py         # File scanning + schema/CRS detection via DuckDB
+│   ├── requirements.txt           # Python deps
+│   └── catalog/                   # Catalog files (created at runtime)
+│       ├── vworld_catalog.db      # Plain DuckDB for app metadata (crawl_state)
+│       └── ducklake_metadata.ducklake  # DuckLake catalog (pipeline output)
 └── frontend/
     ├── src/
+    │   ├── App.tsx                # Main app: routing, state, nav
     │   ├── components/
-    │   │   ├── CrawlerPanel.tsx    # Discovery, pagination, file grid, queue
+    │   │   ├── DirectoryPicker.tsx  # Local directory scan
+    │   │   ├── CrawlerPanel.tsx    # Login/public connect, discovery, file grid, download queue
+    │   │   ├── FileGrid.tsx        # Scanned file list with selection
     │   │   ├── SchemaEditor.tsx    # Column rename/drop with preview
     │   │   ├── PipelineProgress.tsx # Real-time node status + rejects
-    │   │   ├── DuckLakeConsole.tsx # Tables, snapshots, operations
-    │   │   └── MapPreview.tsx      # Minimal leaflet/deckgl confirmation
-    │   └── hooks/
-    │       └── useWebSocket.ts     # Pipeline progress subscription
+    │   │   └── DuckLakeConsole.tsx # Tables, snapshots, operations
+    │   └── lib/
+    │       ├── api.ts             # API base URL + wsUrl helper
+    │       └── utils.ts           # Utility functions
     └── ...
 ```
