@@ -34,6 +34,8 @@ from db import ducklake_db, metadata_path as _default_metadata_path
 from schema_detector import (
     _get_conn,
     _is_parquet,
+    _parquet_crs,
+    _parquet_geo_metadata,
     _unzip_spatial,
     parquet_geometry_info,
 )
@@ -61,6 +63,61 @@ class PipelineResult:
     snapshot_version: str = ""
     files_processed: int = 0
     error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# CRS detection + reprojection
+# ---------------------------------------------------------------------------
+
+# CRS strings that need no reprojection (already WGS84 lon/lat)
+_CRS84_EQUIVALENTS = {"EPSG:4326", "OGC:CRS84", "CRS84", "WGS84", "WGS 84"}
+
+
+def detect_source_crs(read_path: str) -> str | None:
+    """Detect the CRS of a spatial file.
+
+    GeoParquet: from 'geo' key-value metadata (default OGC:CRS84 per spec).
+    GDAL formats (.shp/.geojson/.gpkg): ST_CRS on the first geometry.
+
+    Returns a CRS string ST_Transform understands ('EPSG:5179', WKT, PROJJSON),
+    or None if unknown.
+    """
+    conn = _get_conn()
+    try:
+        if _is_parquet(read_path):
+            crs = _parquet_crs(_parquet_geo_metadata(conn, read_path))
+            return crs or None
+        row = conn.execute(
+            "SELECT ST_CRS(geom) FROM ST_Read(?) LIMIT 1", [read_path]
+        ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+    except Exception as e:
+        logger.warning("CRS detection failed for %s: %s", read_path, e)
+    return None
+
+
+def _normalize_crs(crs: str) -> str:
+    """Extract 'EPSG:nnnn' from PROJJSON/WKT when possible, else return raw."""
+    import json as _json
+    if crs.startswith("{"):
+        try:
+            data = _json.loads(crs)
+            if "id" in data and "code" in data["id"]:
+                return f"EPSG:{data['id']['code']}"
+            return data.get("name", crs)
+        except (ValueError, TypeError):
+            return crs
+    return crs
+
+
+def _crs_needs_reproject(crs: str | None) -> bool:
+    if not crs:
+        return False
+    norm = _normalize_crs(crs)
+    return norm.upper().replace(" ", "") not in {
+        c.replace(" ", "") for c in _CRS84_EQUIVALENTS
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +198,30 @@ def _run_single_file(
             )
         else:
             p.source("src.spatial", path=read_path)
+
+        # 1.5 Reproject to EPSG:4326 when the source CRS differs.
+        # All DuckLake tables are stored in WGS84 lon/lat so the map preview
+        # and Wails desktop can consume them without per-table CRS handling.
+        src_crs = detect_source_crs(read_path)
+        if _crs_needs_reproject(src_crs):
+            logger.info(
+                "Reprojecting %s: %s → EPSG:4326",
+                os.path.basename(read_path), src_crs,
+            )
+            crs_lit = src_crs.replace("'", "''")  # escape for SQL literal
+            p.transform(
+                "code.sql",
+                sql=(
+                    "SELECT * EXCLUDE (geom), "
+                    f"ST_Transform(geom, '{crs_lit}', 'EPSG:4326', true) AS geom "
+                    "FROM input"
+                ),
+            )
+        elif src_crs is None:
+            logger.warning(
+                "CRS unknown for %s — assuming EPSG:4326",
+                os.path.basename(read_path),
+            )
 
         # 2. Drop columns: OGC_FID + user-dropped
         if drop_cols:
