@@ -167,18 +167,15 @@ export default function MapPreview({ tableName, onClose }: MapPreviewProps) {
   const loadFeatures = useCallback(async (box: Bounds | null) => {
     setFeaturesLoading(true);
     try {
-      const body: any = {};
+      const params = new URLSearchParams();
       if (box) {
-        body.xmin = box.xmin; body.ymin = box.ymin;
-        body.xmax = box.xmax; body.ymax = box.ymax;
+        params.set("xmin", String(box.xmin));
+        params.set("ymin", String(box.ymin));
+        params.set("xmax", String(box.xmax));
+        params.set("ymax", String(box.ymax));
       }
       const res = await fetch(
-        `/api/tables/${encodeURIComponent(tableName)}/features`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
+        `/api/tables/${encodeURIComponent(tableName)}/features?${params}`,
       );
       const data = await res.json();
       if (data.error) setError(data.error);

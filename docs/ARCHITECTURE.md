@@ -216,10 +216,12 @@ Split discovered URLs:
   For each file:
      ├── Full file → pipeline append (write_mode="append")
     └── Delta file → pipeline upsert (write_mode="upsert",
-                 data_date from filename, conflict_columns from UI)
+                 per-file data_date from data_dates vector,
+                 conflict_columns from UI)
          │
-         └── data_date column propagated from file date metadata
-             (file mtime used as fallback for local-mode files)
+         └── data_date column injected as literal DATE in code.sql;
+             DuckLake auto-evolves schema for tables created
+             without it (field-ID resolution — no rewrite needed)
 ```
 
 ## 3. GUI Screens

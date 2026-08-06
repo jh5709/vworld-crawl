@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback, useRef } from "react";
 import { Database, Layers } from "lucide-react";
 import DirectoryPicker from "@/components/DirectoryPicker";
 import CrawlerPanel from "@/components/CrawlerPanel";
@@ -51,6 +51,8 @@ export default function App() {
   const [deltaMode, setDeltaMode] = useState(false);
   const [dataDate, setDataDate] = useState("");
   const [conflictColumn, setConflictColumn] = useState("");
+  // path → deltaDate map populated from recrawl; consumed by SchemaEditor auto-fill
+  const _recrawlDeltaMap = useRef<Map<string, string>>(new Map());
   const [pipelineLoading, setPipelineLoading] = useState(false);
   const [pipelineResult, setPipelineResult] = useState<{
     success?: boolean;
@@ -123,6 +125,12 @@ export default function App() {
         setRowCount(data.row_count ?? 0);
         setValidCount(data.valid_count ?? 0);
         setInvalidCount(data.invalid_count ?? 0);
+        // Auto-fill delta fields from recrawl if this file has a known delta date
+        const deltaDate = _recrawlDeltaMap.current.get(file.path);
+        if (deltaDate) {
+          setDeltaMode(true);
+          setDataDate(deltaDate);
+        }
       }
     } catch (e: any) {
       setSchemaError(e.message ?? "Failed to detect schema");
@@ -187,6 +195,12 @@ export default function App() {
       ? Array.from(selected)
       : [inspectFile.path];
 
+    // Build per-file data_dates from the recrawl delta map when delta mode is on
+    const deltaMap = _recrawlDeltaMap.current;
+    const data_dates = deltaMode
+      ? paths.map((p) => deltaMap.get(p) || dataDate)
+      : [];
+
     const ws = new WebSocket(wsUrl("/ws/pipeline"));
 
     ws.onopen = () => {
@@ -195,6 +209,7 @@ export default function App() {
         dataset_name: datasetName.trim(),
         column_mapping: mapping,
         data_date: deltaMode ? dataDate : "",
+        data_dates: data_dates,
         write_mode: deltaMode ? "upsert" : "append",
         conflict_columns: deltaMode && conflictColumn ? [conflictColumn] : [],
       }));
@@ -238,6 +253,15 @@ export default function App() {
       if (dir) handleScan(dir);
     }
   };
+
+  // --- Receives per-file delta dates from CrawlerPanel's onRecrawlDelta ---
+  const handleRecrawlDelta = useCallback((deltaFiles: { name: string; path: string; deltaDate: string }[]) => {
+    const map = new Map<string, string>();
+    for (const f of deltaFiles) {
+      map.set(f.path, f.deltaDate);
+    }
+    _recrawlDeltaMap.current = map;
+  }, []);
 
   // --- Crawler -> scan directory ---
   const handleCrawlerScanDir = (dir: string) => {
@@ -327,7 +351,7 @@ export default function App() {
         )}
 
         {view === "crawler" && (
-          <CrawlerPanel onFilesDownloaded={handleCrawlerFiles} onScanDir={handleCrawlerScanDir} />
+          <CrawlerPanel onFilesDownloaded={handleCrawlerFiles} onScanDir={handleCrawlerScanDir} onRecrawlDelta={handleRecrawlDelta} />
         )}
 
         {view === "grid" && (

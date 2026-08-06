@@ -318,6 +318,7 @@ def run_pipeline(
     data_path: str | None = None,
     metadata_path: str | None = None,
     data_date: str | None = None,
+    data_dates: list[str] | None = None,
     write_mode: str = "append",
     conflict_columns: list[str] | None = None,
     progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
@@ -379,6 +380,12 @@ def run_pipeline(
                     idx, len(shapefile_paths), file_name, "valid"
                 ))
 
+            # Per-file data_date: vector overrides the single fallback
+            file_data_date = (
+                data_dates[idx] if data_dates and idx < len(data_dates) and data_dates[idx]
+                else data_date
+            )
+
             # Pass 1: valid rows → main table
             _run_single_file(
                 path,
@@ -387,16 +394,16 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=True,
-                data_date=data_date,
+                data_date=file_data_date,
                 write_mode=write_mode,
                 conflict_columns=conflict_columns,
                 progress_callback=progress_callback,
             )
 
-            # Send initial pending state for invalid pass
+            # Send initial pending state for invalid passes
             if progress_callback:
                 progress_callback(create_initial_progress(
-                    idx, len(shapefile_paths), file_name, "invalid"
+                    idx, len(shapefile_paths), name, "invalid"
                 ))
 
             # Pass 2: invalid rows → rejects table
@@ -407,7 +414,7 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=False,
-                data_date=data_date,
+                data_date=file_data_date,
                 write_mode=write_mode,
                 conflict_columns=conflict_columns,
                 progress_callback=progress_callback,

@@ -207,7 +207,8 @@ class PipelineRequest(BaseModel):
     paths: list[str]
     dataset_name: str
     column_mapping: list[dict]
-    data_date: str = ""                 # date string for delta files (YYYY-MM-DD or empty)
+    data_date: str = ""                 # per-dataset fallback date string
+    data_dates: list[str] = []           # per-file delta dates (parallel to paths, overrides data_date)
     write_mode: str = "append"          # "append" | "upsert"
     conflict_columns: list[str] = []     # upsert key columns when write_mode="upsert"
 
@@ -216,6 +217,7 @@ class PipelineRequest(BaseModel):
 async def api_run_pipeline(req: PipelineRequest):
     """Run the Duckle pipeline on selected shapefiles."""
     try:
+        data_dates = req.data_dates if req.data_dates and len(req.data_dates) == len(req.paths) else None
         result = run_pipeline(
             shapefile_paths=req.paths,
             dataset_name=req.dataset_name,
@@ -223,6 +225,7 @@ async def api_run_pipeline(req: PipelineRequest):
             data_path=str(data_path()),
             metadata_path=str(metadata_path()),
             data_date=req.data_date or None,
+            data_dates=data_dates,
             write_mode=req.write_mode,
             conflict_columns=req.conflict_columns,
         )
@@ -273,6 +276,7 @@ async def ws_pipeline(ws: WebSocket):
         dataset_name = params.get("dataset_name", "")
         column_mapping = params.get("column_mapping", [])
         data_date = params.get("data_date", "")
+        data_dates = params.get("data_dates", [])
         write_mode = params.get("write_mode", "append")
         conflict_columns = params.get("conflict_columns", [])
         
@@ -306,23 +310,25 @@ async def ws_pipeline(ws: WebSocket):
             except Exception:
                 pass
         
-        # Run pipeline in a thread so the event loop stays responsive
-        import concurrent.futures
-        
-        def run_in_thread():
-            return run_pipeline(
-                shapefile_paths=paths,
-                dataset_name=dataset_name,
-                column_mapping=column_mapping,
-                data_path=str(data_path()),
-                metadata_path=str(metadata_path()),
-                data_date=data_date or None,
-                write_mode=write_mode,
-                conflict_columns=conflict_columns,
-                progress_callback=lambda p: asyncio.run_coroutine_threadsafe(
-                    send_progress(p), loop
-                ),
-            )
+            # Run pipeline in a thread so the event loop stays responsive
+            import concurrent.futures
+            _data_dates = data_dates if data_dates and len(data_dates) == len(paths) else None
+
+            def run_in_thread():
+                return run_pipeline(
+                    shapefile_paths=paths,
+                    dataset_name=dataset_name,
+                    column_mapping=column_mapping,
+                    data_path=str(data_path()),
+                    metadata_path=str(metadata_path()),
+                    data_date=data_date or None,
+                    data_dates=_data_dates,
+                    write_mode=write_mode,
+                    conflict_columns=conflict_columns,
+                    progress_callback=lambda p: asyncio.run_coroutine_threadsafe(
+                        send_progress(p), loop
+                    ),
+                )
         
         loop = asyncio.get_running_loop()
         
@@ -498,23 +504,22 @@ async def api_table_histogram(table_name: str, req: HistogramRequest):
         return {"error": str(e)}
 
 
-class FeaturesRequest(BaseModel):
-    xmin: float | None = None
-    ymin: float | None = None
-    xmax: float | None = None
-    ymax: float | None = None
-    limit: int | None = None
-
-
-@app.post("/api/tables/{table_name}/features")
-async def api_table_features(table_name: str, req: FeaturesRequest):
+@app.get("/api/tables/{table_name}/features")
+async def api_table_features(
+    table_name: str,
+    xmin: float | None = None,
+    ymin: float | None = None,
+    xmax: float | None = None,
+    ymax: float | None = None,
+    limit: int | None = None,
+):
     """GeoJSON features from a table, optionally filtered by bounding box."""
     try:
         return get_features(
             table_name,
-            xmin=req.xmin, ymin=req.ymin,
-            xmax=req.xmax, ymax=req.ymax,
-            limit=req.limit,
+            xmin=xmin, ymin=ymin,
+            xmax=xmax, ymax=ymax,
+            limit=limit,
         )
     except Exception as e:
         logger.exception("Features query failed for %s", table_name)
@@ -994,17 +999,21 @@ class RecrawlRequest(BaseModel):
 def _detect_delta_date(file_name: str) -> str | None:
     """Detect a date embedded in a filename for delta-file identification.
 
-    Common VWorld / geospatial portal patterns:
-      20250801_{dataset}.zip     roads_2025-08-01.zip
-      {dataset}_delta_20250801   delta_202508_roads.shp
+    Common VWorld / geore portals patterns:
+      20250805_{dataset}.zip     roads_2025-08-01.zip
+      {dataset}_delta_20250301   delta_202508_roads.shp
 
-    Returns ISO date string (YYYY-MM-DD) if detected, None otherwise.
+    Uses word-boundary anchors (~nc) to avoid false matches on
+    non-date numeric substrings (e.g., "2015" inside a grid ID).
+    Returns ISO date string (YYYY-MM-DD) if post valid date is found,
+    None either.
     """
     import re
     patterns = [
-        # 20250801 or 2025-08-01
-        (r'(\d{4})(\d{2})(\d{2})', lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}"),
-        (r'(\d{4})-(\d{2})-(\d{2})', lambda m: m.group(0)),
+        # 20250801 → 2025-08-01
+        (r'\b(\d{4})(\d{2})(\d{2})\b', lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}"),
+        # 2025-08-01
+        (r'\b(\d{4})-(\d{2})-(\d{2})\b', lambda m: m.group(0)),
     ]
     for pat, fmt in patterns:
         match = re.search(pat, file_name)

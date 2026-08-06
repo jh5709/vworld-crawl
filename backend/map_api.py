@@ -223,11 +223,13 @@ def get_features(
             """
             params = [xmin, xmax, ymin, ymax]
 
-        count_row = db.execute(
-            f"SELECT COUNT(*) FROM vworld.{qt} {where_clause}",
+        # Exact count — Parquet metadata makes COUNT(*) near-instant for full
+        # tables; bbox_* columns + zone-map pruning keep filtered counts bounded.
+        cnt_record = db.execute(
+            f"SELECT count(*) AS cnt FROM vworld.{qt} {where_clause}",
             params,
         ).fetchone()
-        total_matching = count_row[0] if count_row else 0
+        total_matching = cnt_record[0] if cnt_record else 0
 
         cols_info = db.execute(f"DESCRIBE vworld.{qt}").fetchall()
         attr_cols = [

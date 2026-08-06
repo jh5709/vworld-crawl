@@ -18,6 +18,7 @@ export interface CrawlFile {
   size_str: string;
   date: string;
   description: string;
+  delta_date?: string;  // set by re-crawl for delta files
 }
 
 interface DownloadFileProgress {
@@ -47,6 +48,8 @@ interface DownloadProgress {
 interface CrawlerPanelProps {
   onFilesDownloaded: (downloadDir: string, files: { name: string; path: string }[]) => void;
   onScanDir?: (path: string) => void;
+  /** Forward per-file delta dates from recrawl → parent so SchemaEditor can prepopulate. */
+  onRecrawlDelta?: (files: { name: string; path: string; deltaDate: string }[]) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +87,7 @@ function progressBarWidth(p: number | null): string {
 // Component
 // ---------------------------------------------------------------------------
 
-export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPanelProps) {
+export default function CrawlerPanel({ onFilesDownloaded, onScanDir, onRecrawlDelta }: CrawlerPanelProps) {
   // --- Login / connection state ---
   const [authMode, setAuthMode] = useState<"login" | "public">("public");
   const [host, setHost] = useState("");
@@ -128,6 +131,8 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
     unchanged: CrawlFile[];
     updated: CrawlFile[];
   } | null>(null);
+  // URL → delta_date mapping filled by recrawl, consumed at download-complete
+  const _urlToDeltaDate = useRef<Map<string, string>>(new Map());
 
   // --- Load env credentials on mount ---
   const envLoaded = useRef(false);
@@ -278,8 +283,15 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
         return;
       }
       setRecrawlResult(data);
-      // Pre-select new + updated files
+      // Build URL→deltaDate map so that after download completes we
+      // can forward delta dates to the SchemaEditor pipeline section.
+      const urlMap = new Map<string, string>();
       const allChanged = [...(data.new || []), ...(data.updated || [])];
+      for (const f of allChanged) {
+        if (f.delta_date) urlMap.set(f.url, f.delta_date);
+      }
+      _urlToDeltaDate.current = urlMap;
+      // Pre-select new + updated files
       setSelectedUrls(new Set(allChanged.map((f: CrawlFile) => f.url)));
       setDiscoveredFiles(allChanged);
     } catch (e: any) {
@@ -350,6 +362,19 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
           .map((f: DownloadFileProgress) => ({ name: f.name, path: f.local_path }));
         if (dlFiles.length > 0) {
           onFilesDownloaded(data.download_dir, dlFiles);
+          // Forward delta-date metadata from the re-crawl to the parent
+          if (onRecrawlDelta) {
+            const deltaMap = _urlToDeltaDate.current;
+            const deltaFiles = (data.files || [])
+              .filter((f: DownloadFileProgress) => f.status === "done" && f.local_path)
+              .map((f: DownloadFileProgress) => ({
+                name: f.name,
+                path: f.local_path,
+                deltaDate: deltaMap.get(f.url) || "",
+              }))
+              .filter((f: { deltaDate: string }) => f.deltaDate);
+            if (deltaFiles.length > 0) onRecrawlDelta(deltaFiles);
+          }
         }
       } else if (data.type === "error") {
         setDownloadError(data.error);
