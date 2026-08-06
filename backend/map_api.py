@@ -2,10 +2,11 @@
 Map preview API — spatial queries against DuckLake tables for deck.gl map.
 
 Endpoints (wired in main.py):
-  GET /api/tables/{name}/bounds     → table-wide bounding box
-  GET /api/tables/{name}/stats      → per-column statistics (whole table)
-  GET /api/tables/{name}/features   → GeoJSON features in bounding box, row-limited
-  GET /api/tables/{name}/attributes → paginated attribute rows within bbox
+  GET  /api/tables/{name}/bounds     → table-wide bounding box
+  GET  /api/tables/{name}/stats      → per-column statistics (whole table, one pass)
+  POST /api/tables/{name}/histogram  → value distribution for one column
+  POST /api/tables/{name}/features   → GeoJSON features in bounding box, row-limited
+  POST /api/tables/{name}/attributes → paginated attribute rows within bbox
 
 Row limits per geometry type (configurable):
   - Points:       10 000
@@ -25,6 +26,14 @@ DEFAULT_LIMIT_POINT = 10_000
 DEFAULT_LIMIT_LINESTRING = 2_000
 DEFAULT_LIMIT_POLYGON = 500
 
+NUMERIC_TYPES = {
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+    "FLOAT", "DOUBLE", "DECIMAL", "REAL",
+}
+HISTOGRAM_BINS = 15
+CATEGORICAL_TOP_N = 12
+
 
 @dataclass
 class Bounds:
@@ -35,38 +44,22 @@ class Bounds:
 
 
 def _geometry_type(db, table: str) -> str:
-    """Detect the dominant geometry type in the table.
-
-    Returns one of 'POINT', 'LINESTRING', 'POLYGON', 'MULTI*', or 'MIXED'.
-    """
+    """Detect the dominant geometry type in the table."""
     qt = quote_ident(table)
     db.execute("LOAD spatial")
     results = db.execute(f"""
-        WITH types AS (
-            SELECT ST_GeometryType(geom) AS gtype
-            FROM vworld.{qt}
-            WHERE geom IS NOT NULL
-            LIMIT 100
-        )
-        SELECT gtype, count(*) AS cnt FROM types
-        GROUP BY gtype ORDER BY cnt DESC LIMIT 3
+        SELECT ST_GeometryType(geom) AS gtype, count(*) AS cnt
+        FROM (SELECT geom FROM vworld.{qt} WHERE geom IS NOT NULL LIMIT 100)
+        GROUP BY gtype ORDER BY cnt DESC LIMIT 1
     """).fetchall()
     if not results:
         return "OTHER"
-    # Simplification: collapse MULTI* prefixes
-    primary = results[0][0].replace("MULTI", "")
-    mapping = {
-        "POINT": "POINT",
-        "LINESTRING": "LINESTRING",
-        "POLYGON": "POLYGON",
-    }
-    return mapping.get(primary, primary)
+    return results[0][0].replace("MULTI", "")
 
 
 def get_bounds(table_name: str) -> Optional[Bounds]:
     """Compute the full-table bounding box from bbox_* columns."""
     with ducklake_db() as db:
-        db.execute("LOAD spatial")
         qt = quote_ident(table_name)
         row = db.execute(f"""
             SELECT
@@ -83,73 +76,115 @@ def get_bounds(table_name: str) -> Optional[Bounds]:
 
 
 def get_stats(table_name: str) -> dict:
-    """Per-column statistics for the whole table."""
+    """Per-column statistics for the whole table, in a single SUMMARIZE pass."""
     with ducklake_db() as db:
         qt = quote_ident(table_name)
-        # Get column names and types (DESCRIBE returns: cid, name, type, notnull, dflt_value, pk)
-        cols = db.execute(f"DESCRIBE vworld.{qt}").fetchall()
+        rows = db.execute(f"SUMMARIZE vworld.{qt}").fetchall()
+        # SUMMARIZE columns: column_name, column_type, min, max, approx_unique,
+        #                    avg, std, q25, q50, q75, count, null_percentage
         stats: list[dict] = []
-        for row in cols:
-            col_name = row[0]  # name is index 0
-            col_type = row[1]  # type is index 1
-            if col_name in ("geom", "geom_wkb"):
-                continue  # skip geometry columns
-            qc = quote_ident(col_name)
-            try:
-                row = db.execute(f"""
-                    SELECT
-                        COUNT(*) AS cnt,
-                        COUNT("{qc}") AS non_null,
-                        COUNT(*) - COUNT("{qc}") AS nulls,
-                        COUNT(DISTINCT "{qc}") AS distinct_vals,
-                        MIN("{qc}")::VARCHAR AS min_val,
-                        MAX("{qc}")::VARCHAR AS max_val
-                    FROM vworld.{qt}
-                """).fetchone()
-                if row:
-                    stats.append({
-                        "name": col_name,
-                        "type": col_type.upper() if col_type else "VARCHAR",
-                        "count": row[0],
-                        "non_null": row[1],
-                        "nulls": row[2],
-                        "distinct": row[3],
-                        "min": row[4],
-                        "max": row[5],
-                    })
-            except Exception:
-                # Some types can't be MIN/MAX'd — include what we can
-                try:
-                    row = db.execute(f"""
-                        SELECT COUNT(*) AS cnt,
-                               COUNT("{qc}") AS non_null,
-                               COUNT(DISTINCT "{qc}") AS distinct_vals
-                        FROM vworld.{qt}
-                    """).fetchone()
-                    if row:
-                        stats.append({
-                            "name": col_name,
-                            "type": col_type.upper() if col_type else "VARCHAR",
-                            "count": row[0],
-                            "non_null": row[1],
-                            "nulls": row[0] - row[1],
-                            "distinct": row[2],
-                            "min": None,
-                            "max": None,
-                        })
-                except Exception:
-                    # Even more basic — just count + type
-                    stats.append({
-                        "name": col_name,
-                        "type": col_type.upper() if col_type else "VARCHAR",
-                        "count": None,
-                        "non_null": None,
-                        "nulls": None,
-                        "distinct": None,
-                        "min": None,
-                        "max": None,
-                    })
+        for r in rows:
+            name, ctype = r[0], r[1]
+            if name in ("geom", "geom_wkb"):
+                continue
+            count = _to_int(r[10])
+            null_pct = _to_float(r[11])
+            stats.append({
+                "name": name,
+                "type": ctype.upper() if ctype else "VARCHAR",
+                "count": count,
+                "non_null": round(count * (1 - null_pct / 100)) if count is not None and null_pct is not None else None,
+                "nulls": round(count * null_pct / 100) if count is not None and null_pct is not None else None,
+                "distinct": _to_int(r[4]),
+                "min": None if r[2] is None else str(r[2]),
+                "max": None if r[3] is None else str(r[3]),
+                "avg": _to_float(r[5]),
+                "std": _to_float(r[6]),
+                "q25": _to_float(r[7]),
+                "q50": _to_float(r[8]),
+                "q75": _to_float(r[9]),
+            })
         return {"table": table_name, "columns": stats}
+
+
+def get_histogram(table_name: str, column: str) -> dict:
+    """Value distribution for one column.
+
+    Numeric columns with many distinct values → equal-width histogram bins.
+    Low-cardinality / text columns → top-N categorical counts.
+    """
+    with ducklake_db() as db:
+        qt = quote_ident(table_name)
+        qc = quote_ident(column)
+
+        # Validate column exists and get its type
+        cols = db.execute(f"DESCRIBE vworld.{qt}").fetchall()
+        col_row = next((c for c in cols if c[0] == column), None)
+        if col_row is None:
+            return {"error": f"Column '{column}' not found"}
+        ctype = (col_row[1] or "").upper()
+        base_type = ctype.split("(")[0]  # DECIMAL(10,2) → DECIMAL
+
+        total = db.execute(f'SELECT COUNT({qc}) FROM vworld.{qt}').fetchone()[0]
+        distinct = db.execute(
+            f'SELECT COUNT(DISTINCT {qc}) FROM vworld.{qt}'
+        ).fetchone()[0]
+
+        is_numeric = base_type in NUMERIC_TYPES
+
+        if is_numeric and distinct > HISTOGRAM_BINS:
+            # Numeric histogram — equal-width bins
+            mm = db.execute(
+                f'SELECT MIN({qc})::DOUBLE, MAX({qc})::DOUBLE FROM vworld.{qt}'
+            ).fetchone()
+            lo, hi = float(mm[0]), float(mm[1])
+            if lo == hi:
+                return {
+                    "column": column, "kind": "numeric",
+                    "total": total, "distinct": distinct,
+                    "bins": [{"label": str(lo), "count": total}],
+                }
+            bin_rows = db.execute(f"""
+                SELECT WIDTH_BUCKET({qc}::DOUBLE, ?, ?, {HISTOGRAM_BINS}) AS bucket,
+                       COUNT(*) AS cnt
+                FROM vworld.{qt}
+                WHERE {qc} IS NOT NULL
+                GROUP BY bucket ORDER BY bucket
+            """, [lo, hi]).fetchall()
+            width = (hi - lo) / HISTOGRAM_BINS
+            counts = {int(b): int(c) for b, c in bin_rows}
+            bins = []
+            for b in range(1, HISTOGRAM_BINS + 1):
+                b_lo = lo + (b - 1) * width
+                b_hi = lo + b * width
+                bins.append({
+                    "label": f"{b_lo:g}–{b_hi:g}",
+                    "count": counts.get(b, 0),
+                })
+            return {
+                "column": column, "kind": "numeric",
+                "total": total, "distinct": distinct,
+                "min": lo, "max": hi, "bins": bins,
+            }
+
+        # Categorical — top-N values
+        val_rows = db.execute(f"""
+            SELECT CAST({qc} AS VARCHAR) AS val, COUNT(*) AS cnt
+            FROM vworld.{qt}
+            GROUP BY val ORDER BY cnt DESC
+            LIMIT {CATEGORICAL_TOP_N + 1}
+        """).fetchall()
+        top = val_rows[:CATEGORICAL_TOP_N]
+        other = sum(int(r[1]) for r in val_rows[CATEGORICAL_TOP_N:])
+        categories = [{"label": r[0] if r[0] is not None else "(null)",
+                       "count": int(r[1])} for r in top]
+        if other > 0:
+            categories.append({"label": "(other)", "count": other})
+        return {
+            "column": column, "kind": "categorical",
+            "total": total, "distinct": distinct,
+            "categories": categories,
+        }
 
 
 def get_features(
@@ -188,21 +223,18 @@ def get_features(
             """
             params = [xmin, xmax, ymin, ymax]
 
-        # Count total matching rows
         count_row = db.execute(
             f"SELECT COUNT(*) FROM vworld.{qt} {where_clause}",
             params,
         ).fetchone()
         total_matching = count_row[0] if count_row else 0
 
-        # Fetch features — build GeoJSON in Python from DESCRIBE columns
         cols_info = db.execute(f"DESCRIBE vworld.{qt}").fetchall()
         attr_cols = [
-            c[0] for c in cols_info  # name at index 0
+            c[0] for c in cols_info
             if c[0] not in ("geom", "geom_wkb", "bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax")
         ]
 
-        # Build query to get GeoJSON geometries + attribute columns
         col_list = ", ".join(quote_ident(c) for c in attr_cols)
         sql = f"""
             SELECT ST_AsGeoJSON(geom)::VARCHAR AS geojson,
@@ -213,30 +245,22 @@ def get_features(
         """
         data = db.execute(sql, params).fetchall()
 
+        import json as _json
         features = []
         for row in data:
             geojson_str = row[0]
             props = {}
             for i, col in enumerate(attr_cols):
-                val = row[i + 1]
-                # Convert Python types to JSON-compatible
-                if isinstance(val, (int, float, str, bool, type(None))):
-                    props[col] = val
-                else:
-                    props[col] = str(val)
+                props[col] = _safe_value(row[i + 1])
+            try:
+                geom = _json.loads(geojson_str)
+            except Exception:
+                geom = None
             features.append({
                 "type": "Feature",
-                "geometry": None,  # will parse below
+                "geometry": geom,
                 "properties": props,
-                "_geojson_geom": geojson_str,
             })
-            # Parse the GeoJSON geometry
-            import json as _json
-            try:
-                features[-1]["geometry"] = _json.loads(geojson_str)
-            except Exception:
-                features[-1]["geometry"] = None
-            del features[-1]["_geojson_geom"]
 
         return {
             "type": "FeatureCollection",
@@ -260,7 +284,6 @@ def get_attributes(
 ) -> dict:
     """Paginated attribute rows for the attribute table view."""
     with ducklake_db() as db:
-        db.execute("LOAD spatial")
         qt = quote_ident(table_name)
         cols_info = db.execute(f"DESCRIBE vworld.{qt}").fetchall()
         attr_cols = [
@@ -286,7 +309,7 @@ def get_attributes(
 
         rows = db.execute(
             f"SELECT {col_list} FROM vworld.{qt} {where_clause} "
-            f"ORDER BY 1 LIMIT {limit} OFFSET {offset}",
+            f"LIMIT {limit} OFFSET {offset}",
             params,
         ).fetchall()
 
@@ -310,3 +333,21 @@ def _safe_value(val):
     if isinstance(val, (int, float, str, bool)):
         return val
     return str(val)
+
+
+def _to_int(val) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None

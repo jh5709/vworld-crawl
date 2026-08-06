@@ -46,6 +46,11 @@ export default function App() {
 
   // Pipeline
   const [datasetName, setDatasetName] = useState("");
+
+  // Delta load (upsert) options
+  const [deltaMode, setDeltaMode] = useState(false);
+  const [dataDate, setDataDate] = useState("");
+  const [conflictColumn, setConflictColumn] = useState("");
   const [pipelineLoading, setPipelineLoading] = useState(false);
   const [pipelineResult, setPipelineResult] = useState<{
     success?: boolean;
@@ -189,6 +194,9 @@ export default function App() {
         paths,
         dataset_name: datasetName.trim(),
         column_mapping: mapping,
+        data_date: deltaMode ? dataDate : "",
+        write_mode: deltaMode ? "upsert" : "append",
+        conflict_columns: deltaMode && conflictColumn ? [conflictColumn] : [],
       }));
     };
 
@@ -381,6 +389,12 @@ export default function App() {
               onDatasetNameChange={setDatasetName}
               onRunPipeline={handleRunPipeline}
               pipelineLoading={pipelineLoading}
+              deltaMode={deltaMode}
+              onDeltaModeChange={setDeltaMode}
+              dataDate={dataDate}
+              onDataDateChange={setDataDate}
+              conflictColumn={conflictColumn}
+              onConflictColumnChange={setConflictColumn}
               pipelineResult={pipelineResult}
               pipelineProgress={pipelineProgress}
             />

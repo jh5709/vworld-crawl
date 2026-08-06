@@ -153,15 +153,15 @@ def _run_single_file(
         if rename_map:
             p.rename(**rename_map)
 
-        # 5. SQL: add WKB + bounding box + data_date columns
-        data_date_sql = ""
+        # 5. SQL: add WKB + bounding box + optional data_date column
+        date_cols = ""
         if data_date:
-            # Add data_date as a literal column for delta files
-            date_cols = ", " + ", ".join(
-                f"'{data_date}'::DATE AS {c}" for c in ["data_date"]
-            )
-        else:
-            date_cols = ""
+            import re as _re
+            if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_date):
+                raise ValueError(
+                    f"data_date must be YYYY-MM-DD, got {data_date!r}"
+                )
+            date_cols = f", '{data_date}'::DATE AS data_date"
         p.transform(
             "code.sql",
             sql=f"""
@@ -178,18 +178,17 @@ def _run_single_file(
         # 6. Validate: split valid/invalid geometries
         p.transform("qa.geomvalidate", geometryColumn="geom", mode=mode)
 
-        # 7. Sink: write to DuckLake (append or upsert for delta files)
+        # 7. Sink: write to DuckLake.
+        # Valid rows honor write_mode (append or upsert for delta files);
+        # rejects always append.
         sink_props: dict = {
             "path": metadata_path,
             "dataPath": data_path,
             "tableName": table_name,
-            "mode": write_mode if not keep_valid else write_mode,  # always append for rejects
+            "mode": write_mode if keep_valid else "append",
         }
-        if write_mode == "upsert" and conflict_columns and keep_valid:
+        if keep_valid and write_mode == "upsert" and conflict_columns:
             sink_props["conflictColumns"] = conflict_columns
-        # rejects always append
-        if not keep_valid:
-            sink_props["mode"] = "append"
         p.sink("snk.ducklake", **sink_props)
 
         # Capture duckle's stdout to parse progress

@@ -35,6 +35,12 @@ interface SchemaEditorProps {
   onDatasetNameChange: (name: string) => void;
   onRunPipeline: () => void;
   pipelineLoading: boolean;
+  deltaMode: boolean;
+  onDeltaModeChange: (v: boolean) => void;
+  dataDate: string;
+  onDataDateChange: (v: string) => void;
+  conflictColumn: string;
+  onConflictColumnChange: (v: string) => void;
   pipelineResult: {
     success?: boolean;
     rows_loaded?: number;
@@ -71,6 +77,12 @@ export default function SchemaEditor({
   onDatasetNameChange,
   onRunPipeline,
   pipelineLoading,
+  deltaMode,
+  onDeltaModeChange,
+  dataDate,
+  onDataDateChange,
+  conflictColumn,
+  onConflictColumnChange,
   pipelineResult,
   pipelineProgress,
 }: SchemaEditorProps) {
@@ -323,6 +335,50 @@ export default function SchemaEditor({
             )}
             {pipelineLoading ? "Running..." : "Run Pipeline"}
           </button>
+        </div>
+
+        {/* Delta load (upsert) options */}
+        <div className="border-t border-neutral-800/50 pt-3">
+          <label className="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={deltaMode}
+              onChange={(e) => onDeltaModeChange(e.target.checked)}
+              className="rounded border-neutral-700 bg-neutral-900"
+            />
+            Delta file — upsert merge instead of append
+          </label>
+          {deltaMode && (
+            <div className="flex items-center gap-2 mt-2">
+              <input
+                type="date"
+                value={dataDate}
+                onChange={(e) => onDataDateChange(e.target.value)}
+                className="px-2.5 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono"
+                title="Data date (publication date of this delta)"
+              />
+              <select
+                value={conflictColumn}
+                onChange={(e) => onConflictColumnChange(e.target.value)}
+                className="flex-1 px-2.5 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono"
+                title="Upsert key column (rows matching this column are replaced)"
+              >
+                <option value="">Upsert key column…</option>
+                {mapping
+                  .filter((m) => !m.drop)
+                  .map((m) => (
+                    <option key={m.original} value={m.renamed || m.original}>
+                      {m.renamed || m.original}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          )}
+          {deltaMode && !conflictColumn && (
+            <p className="text-[11px] text-amber-500/80 mt-1">
+              Select an upsert key column — rows matching it are replaced, others inserted.
+            </p>
+          )}
         </div>
 
         {/* Pipeline progress */}

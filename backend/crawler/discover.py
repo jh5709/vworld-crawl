@@ -291,14 +291,9 @@ def discover_files(
         soup = BeautifulSoup(resp.text, "html.parser")
         result.files = _extract_files(soup, sel)
 
-        # Capture ETag/Last-Modified from response (apply to all files on page)
-        etag = resp.headers.get("etag", "")
-        last_mod = resp.headers.get("last-modified", "")
-        for f in result.files:
-            if etag:
-                f.etag = etag
-            if last_mod:
-                f.last_modified = last_mod
+        # Note: the listing page's ETag/Last-Modified are NOT file-level
+        # metadata. File ETags are captured at download time (download.py)
+        # and during recrawl HEAD checks (main.py).
 
         result.total_pages = _detect_total_pages(soup, sel)
         result.current_page = state.current_page if state else 1

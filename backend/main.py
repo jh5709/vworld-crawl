@@ -8,6 +8,7 @@ and exposes REST + WebSocket endpoints for pipeline operations.
 import logging
 import os
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -190,8 +191,8 @@ from crawler.download import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_DOWNLOAD_DIR,
 )
-from crawler.state import CrawlEntry, upsert_entry, link_to_dataset, get_entries_by_dataset, cleanup_source_files, get_staged_entries, delete_staged_files, check_changes
-from map_api import get_bounds, get_stats, get_features, get_attributes
+from crawler.state import CrawlEntry, upsert_entry, link_to_dataset, get_entries_by_dataset, cleanup_source_files, get_staged_entries, delete_staged_files, check_changes, list_entries
+from map_api import get_bounds, get_stats, get_features, get_attributes, get_histogram
 
 # Module-level crawler state (single-user app)
 import concurrent.futures
@@ -481,6 +482,20 @@ async def api_table_bounds(table_name: str):
 async def api_table_stats(table_name: str):
     """Per-column statistics for the whole table."""
     return get_stats(table_name)
+
+
+class HistogramRequest(BaseModel):
+    column: str
+
+
+@app.post("/api/tables/{table_name}/histogram")
+async def api_table_histogram(table_name: str, req: HistogramRequest):
+    """Value distribution for one column (numeric bins or categorical top-N)."""
+    try:
+        return get_histogram(table_name, req.column)
+    except Exception as e:
+        logger.exception("Histogram query failed for %s.%s", table_name, req.column)
+        return {"error": str(e)}
 
 
 class FeaturesRequest(BaseModel):
@@ -1003,48 +1018,72 @@ async def api_crawler_recrawl(req: RecrawlRequest):
     """Re-discover files and compare against crawl_state for incremental crawl.
 
     Returns file lists partitioned into new/unchanged/updated based on
-    ETag and Last-Modified comparison.
+    ETag and Last-Modified comparison. Previously downloaded URLs are
+    HEAD-checked to fetch real file-level ETags (page-level ETags from
+    discovery are not comparable).
     """
     global _discovery_state
     session = _crawler_session
     if session is None:
         return {"success": False, "error": "No active session. Connect first."}
 
-    _discovery_state = DiscoveryState(page_url=req.page_url.strip())
+    _discovery_state = DiscoveryState(page_url=req.page_url)
 
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        files_raw = await loop.run_in_executor(
-            pool,
-            lambda: (
-                discover_all_pages(session, req.page_url, _discovery_state)
-                if req.auto
-                else discover_page(session, req.page_url, _discovery_state, page_num=1)
-            ),
-        )
+        if req.auto:
+            result = await loop.run_in_executor(
+                pool,
+                lambda: discover_all_pages(session, req.page_url, state=_discovery_state),
+            )
+        else:
+            result = await loop.run_in_executor(
+                pool,
+                lambda: discover_files(session, req.page_url, DEFAULT_SELECTORS, _discovery_state),
+            )
 
-    # Build list for check_changes (dicts with url, etag, last_modified)
+    if result.error:
+        return {"success": False, "error": result.error}
+
+    # Build comparison list (etag/lm filled below via HEAD checks)
     discovered = [
         {
-            "url": f.get("url", ""),
-            "name": f.get("name", ""),
-            "size": f.get("size", 0),
-            "size_str": f.get("size_str", ""),
-            "date": f.get("date", ""),
-            "description": f.get("description", ""),
-            "etag": f.get("etag", ""),
-            "last_modified": f.get("last_modified", ""),
+            "url": f.url,
+            "name": f.name,
+            "size": f.size,
+            "size_str": f.size_str,
+            "date": f.date,
+            "description": f.description,
+            "etag": "",
+            "last_modified": "",
         }
-        for f in files_raw
+        for f in result.files
     ]
+
+    # HEAD-check URLs that exist in crawl_state — the listing page's ETag is
+    # NOT the file's ETag, so a real per-file check is needed for change detection.
+    MAX_HEAD_CHECKS = 50
+    known = {e.url: e for e in list_entries()}
+    to_check = [
+        d for d in discovered
+        if d["url"] in known
+        and (known[d["url"]].etag or known[d["url"]].last_modified)
+    ][:MAX_HEAD_CHECKS]
+    for d in to_check:
+        try:
+            resp = session.client.head(d["url"], follow_redirects=True)
+            d["etag"] = resp.headers.get("etag", "")
+            d["last_modified"] = resp.headers.get("last-modified", "")
+        except Exception as e:
+            logger.debug("HEAD check failed for %s: %s", d["url"], e)
+        time.sleep(0.2)  # gentle pacing between HEAD requests
 
     # Split into new/unchanged/updated
     changes = check_changes(discovered)
 
     # Detect potential delta files
     for f in changes.get("new", []) + changes.get("updated", []):
-        date = _detect_delta_date(f.get("name", ""))
-        f["delta_date"] = date
+        f["delta_date"] = _detect_delta_date(f.get("name", ""))
 
     return {
         "success": True,
@@ -1052,6 +1091,7 @@ async def api_crawler_recrawl(req: RecrawlRequest):
         "new_count": len(changes.get("new", [])),
         "unchanged_count": len(changes.get("unchanged", [])),
         "updated_count": len(changes.get("updated", [])),
+        "head_checks": len(to_check),
         "new": changes.get("new", []),
         "unchanged": changes.get("unchanged", []),
         "updated": changes.get("updated", []),
