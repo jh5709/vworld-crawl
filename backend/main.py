@@ -1010,7 +1010,7 @@ async def api_crawler_recrawl(req: RecrawlRequest):
     if session is None:
         return {"success": False, "error": "No active session. Connect first."}
 
-    _discovery_state = DiscoveryState()
+    _discovery_state = DiscoveryState(page_url=req.page_url.strip())
 
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
