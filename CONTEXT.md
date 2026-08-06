@@ -53,7 +53,7 @@ A province file containing the complete dataset for that province. Replaces or a
 _Avoid_: Complete, snapshot file
 
 **Delta file**:
-A province file containing only changed rows (inserts, updates, deletes) since a prior publication date. Identified by date metadata in the filename or companion metadata. Merged via Duckle upsert.
+A province file containing only changed rows (inserts, updates, deletes) since a prior publication date. Identified by date metadata in the filename (e.g., `roads_20250801.zip`) or companion metadata. Merged via Duckle upsert with a `data_date` column and an upsert key column. The Schema Editor's "Advanced — delta load" section exposes the toggle, date, and key-column selector.
 _Avoid_: Incremental, diff, patch
 
 **Data date**:
@@ -118,6 +118,26 @@ Per-file progress streamed via WebSocket during batch downloads. Each file repor
 
 **Crawler stop**:
 Both discovery and download support cancellation. Discovery stop sets a flag checked between pages (with future cancellation for thread-based runs). Download stop sets a flag checked per chunk (64KB). Stopped operations preserve accumulated files and completed downloads.
+
+**Re-crawl**:
+An incremental crawl that re-discovers all files but downloads only those that changed. Compares each URL against crawl_state by fetching a real file ETag/Last-Modified via HEAD requests (capped at 50, 0.2s pacing). Returns three buckets: new, updated, unchanged. The GUI shows a change summary panel and pre-selects new+updated files. Delta file dates are auto-detected from filenames (YYYYMMDD or YYYY-MM-DD patterns). Endpoint: `POST /api/crawler/recrawl`.
+_Avoid_: Refresh, re-discover
+
+**HEAD check**:
+A lightweight HTTP HEAD request to an individual file URL to retrieve its current ETag and Last-Modified, used during re-crawl to compare against stored crawl_state values. The listing page's own ETag is NOT the file's ETag, so per-file checks are required for accurate change detection. Limited to 50 requests at 0.2s intervals.
+_Avoid_: Probe, etag fetch
+
+**Upsert merge**:
+A pipeline write mode (`write_mode="upsert"`) that replaces rows matching a conflict (upsert key) column and inserts new rows. Delta files use this so updated features replace prior versions instead of duplicating. Reject tables always append regardless of mode.
+_Avoid_: Merge-insert, overwrite
+
+**Reprojection**:
+Automatic CRS transformation at pipeline step 1.5 (after source, before transforms). Source CRS detected via `ST_CRS(geom)` for GDAL formats or GeoParquet `geo` metadata. If source CRS differs from EPSG:4326, a `code.sql` step uses `ST_Transform(geom, src, 'EPSG:4326', always_xy:=true)` — the `always_xy` flag prevents PROJ's authority-compliant lat/lon axis swap. Unknown CRS logs a warning and passes through. All DuckLake tables store WGS84 lon/lat.
+_Avoid_: CRS convert, transform
+
+**Map preview**:
+A deck.gl map overlay opened from the DuckLake console (green map-icon per table). Shows the full-table bounding box (dashed yellow). User toggles draw mode for rectangle selection; row limits adapt to geometry type (points 10k, lines 2k, polygons 500). Bright layers (cyan/fuchsia/lime) render on CARTO dark basemap tiles. Side panel: Statistics tab (column stats with expandable histograms) and Attributes tab (paginated rows with spatial filter). Endpoints: `/api/tables/{name}/bounds`, `/stats`, `/features`, `/attributes`, `/histogram`.
+_Avoid_: GIS viewer, mini-map
 
 **DuckLake storage**:
 The lakehouse proper — DuckLake tables, their Parquet data files, and snapshots. Permanent and queryable. Distinguished from download staging in the console's storage summary.

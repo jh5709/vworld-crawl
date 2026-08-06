@@ -155,6 +155,11 @@ For each province file in dataset:
   → code.sql(EXCLUDE geom_col, ST_GeomFromWKB(geom_col) AS geom)
   │
   ▼
+CRS detection + reproject to EPSG:4326 (step 1.5)
+  ST_Transform(geom, detected_crs, 'EPSG:4326', always_xy:=true)
+  Only when source CRS ≠ 4326 (WGS84); skipped for unknown CRS with warning
+  │
+  ▼
 xf.rename(RN="road_id", ROAD_NAME="name", LENG="length_m")
   │
   ▼
@@ -170,8 +175,11 @@ code.sql(  -- WKB + bbox enrichment
   │
   ▼
 qa.geomvalidate()
-  ├── valid ──▶ snk.ducklake(table="roads", write_mode="append")
-  └── reject ─▶ snk.ducklake(table="roads_rejects", write_mode="append")
+  ├── valid ──▶ snk.ducklake(table="roads",
+                mode=write_mode,                 ← whether "append" or "upsert" (delta)
+                conflictColumns=[upsert_key_col])  ← upsert key from UI
+  └── reject ─▶ snk.ducklake(table="roads_rejects",
+                 mode="append")
                    │
                    ▼ (after all provinces appended)
          Post-crawl operations:
@@ -181,16 +189,37 @@ qa.geomvalidate()
 
 ### 2.3 Re-crawl (Incremental)
 ```
-Re-crawl discovery → Compare against crawl_state table
-  │
-  ├── Unchanged files → skip
-  │
-  └── Changed files:
-        ├── Full file → replace/append snapshot
-        └── Delta file → upsert merge (identified by date metadata)
-                            │
-                            ▼
-                  data_date column populated from file metadata
+User clicks Re-crawl (CrawlerPanel, same connected session)
+    │
+    ▼
+Re-discover all files (same paginated walk)
+    │
+    ▼
+Split discovered URLs:
+  ├── Not in crawl_state → "new" (no HEAD needed)
+  └── In crawl_state → HEAD request per URL (max 50, 0.2s pace)
+         │
+         ▼ Real ETag/Last-Modified from file response
+    check_changes() compares against stored crawl_state values
+         │
+         ├── ETag + Last-Modified match → "unchanged" (skip)
+         └── ETag / Last-Modified differ wear → "updated"
+              │
+              ▼
+  GUI: change summary panel (new / updated / unchanged counts)
+  new + updated files pre-selected for download
+    │
+    ▼
+  Download only changed files
+    │
+    ▼
+  For each file:
+     ├── Full file → pipeline append (write_mode="append")
+    └── Delta file → pipeline upsert (write_mode="upsert",
+                 data_date from filename, conflict_columns from UI)
+         │
+         └── data_date column propagated from file date metadata
+             (file mtime used as fallback for local-mode files)
 ```
 
 ## 3. GUI Screens
@@ -207,11 +236,13 @@ Re-crawl discovery → Compare against crawl_state table
 - Select All / Filter by name
 - Batch size selector (default 3)
 - Download queue with per-file progress bars (indeterminate for unknown-size)
+- **Re-crawl** button (green): re-discovers all files, HEAD-checks known URLs against crawl_state, shows new/updated/unchanged summary, pre-selects changes
 - "Stop" to cancel mid-crawl (both discovery and download)
 
 ### Screen 2: Schema Editor
 - Raw columns from shapefile (auto-detected)
-- Per-column: editable new name, toggle to drop
+- Per-column: readable new name, toggle to drop
+- **Advanced — delta load** section: checkbox to enable upsert-merge, date picker for data_date, dropdown for upsert key column (from mapped columns)
 - Preview: first N rows with current mapping applied
 - "Run Pipeline" button → WebSocket progress
 
@@ -222,15 +253,24 @@ Re-crawl discovery → Compare against crawl_state table
 - Final summary after completion
 
 ### Screen 4: DuckLake Console
-- Table list: name, latest snapshot, file count, total size
+- Table list: name, latest snapshot, feature count, total size
 - Snapshot timeline per table (click to expand)
-- Table actions: Compact, Rewrite Data Files, Expire Snapshots
-- Reject table browser: inspect failed rows with error reasons
+- **Originals in staging** per table: source files with Loaded/Cleared status dots, Clear staging, Re-download
+- **Download staging** section: total files/size, not-yet-loaded list with Load-into-table and Delete
+- Table actions: Compact, Rewrite Data Files, Expire Snapshots, **View on Map** (green map-icon per row)
+- Reject table rider with Inspect button
 
-### Screen 5: Map Preview (minimal)
-- Lightweight map (Leaflet or minimal DeckGL)
-- Feature count + bounding box overlay
-- Purpose: confirm pipeline output, not full GIS
+### Screen 5: Map Preview
+- **deck.gl** overlay with **CARTO dark** blastermap tiles (`dark_all`)
+- Full-table bounding box: dashed yellow outline, fits viewport on open
+- **Draw mode** toggle button (box-select icon, cyan when active): map scrolling disabled during draws; drag a rectangle to generate spatial filter
+- Auto row limits per geometry type: points 10,000, linestrings 2,000, polygons 500
+- **Points** → cyan ScatterplotLayer, **Lines** → fuscia GeoJsonLayer, **Polygons** → lime GeoJsonLayer
+- Side panel (1/4 width, 2 tabs):
+  - **Statistics tab**: per-column rows/distinct/null, avg/median, in-line (min/max); each row expands to a histogram (numeric: 15-bin equal-width bars; decategorical: top-12 category bars)
+  - **Attributes tab**: digital table (50 rows per page) with spatial filter
+- Map information bar: table name, matching rows (actual vs filtered), geometry type, limit
+- Top controls: draw method (toggle), whole selection, fit to table
 
 ## 4. Pipeline Per-Row Columns
 
@@ -257,7 +297,7 @@ Every DuckLake table row includes:
 | Database | DuckDB + DuckLake extension | 1.5.2+ |
 | Data Format | Parquet (via DuckLake) | — |
 | Frontend | React + TypeScript + shadcn/ui | React 19 |
-| Map Preview | Leaflet (or minimal DeckGL) | — |
+| Map Preview | deck.gl + CARTO dark tiles | React 19 |
 | GIS Viewer | Go/Wails desktop (existing) | — |
 | Design | Figma + shadcn/ui Figma kit | — |
 
@@ -293,8 +333,9 @@ vworld-crawl/
 │   │   └── state.py               # Crawl state persistence in plain DuckDB catalog
 │   ├── pipeline/
 │   │   ├── __init__.py
-│   │   ├── runner.py              # Duckle pipeline builder (thin abstraction)
+│   │   ├── runner.py              # Duckle pipeline builder + CRS detection + reproject step 1.5
 │   │   └── progress.py            # Pipeline progress parser
+│   ├── map_api.py                 # Spatial queries: bounds, stats, features, histograms
 │   ├── db.py                      # Shared DuckDB connection helper
 │   ├── catalog.py                 # Catalog abstraction (DuckDB | PostgreSQL)
 │   ├── ducklake_ops.py            # DuckLake extension setup + ATTACH
@@ -309,11 +350,12 @@ vworld-crawl/
     │   ├── App.tsx                # Main app: routing, state, nav
     │   ├── components/
     │   │   ├── DirectoryPicker.tsx  # Local directory scan
-    │   │   ├── CrawlerPanel.tsx    # Login/public connect, discovery, file grid, download queue
+    │   │   ├── CrawlerPanel.tsx    # Login/public connect, discovery, file grid, download, re-crawl
     │   │   ├── FileGrid.tsx        # Scanned file list with selection
-    │   │   ├── SchemaEditor.tsx    # Column rename/drop with preview
+    │   │   ├── SchemaEditor.tsx    # Column rename/drop + delta load mode (upsert, data_date)
     │   │   ├── PipelineProgress.tsx # Real-time node status + rejects
-    │   │   └── DuckLakeConsole.tsx # Tables, snapshots, operations
+    │   │   ├── DuckLakeConsole.tsx # Tables, snapshots, staging, compact, map button
+│   │   └── MapPreview.tsx       # deck.gl map: draw-mode rectangle select, histograms, attrs
     │   └── lib/
     │       ├── api.ts             # API base URL + wsUrl helper
     │       └── utils.ts           # Utility functions
