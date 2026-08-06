@@ -30,7 +30,7 @@ from typing import Callable, Optional
 import duckle
 
 from db import data_path as _default_data_path
-from db import ducklake_db, metadata_path as _default_metadata_path
+from db import ducklake_db, metadata_path as _default_metadata_path, quote_ident
 from schema_detector import (
     _get_conn,
     _is_parquet,
@@ -155,11 +155,19 @@ def _run_single_file(
     # Build drop, keep, rename maps.
     # Note: OGC_FID is not force-dropped here — xf.project already restricts
     # output to keep_cols, and OGC_FID doesn't exist in GPKG/GeoParquet.
+    #
+    # When column_mapping is empty (user provided no schema), pass all
+    # columns through — do not reduce to only ["geom"]. The empty-list
+    # case means "keep everything", not "keep nothing".
+    has_mapping = bool(column_mapping)
     drop_cols = [c["original"] for c in column_mapping if c.get("drop")]
     keep_cols = [c["original"] for c in column_mapping if not c.get("drop")]
     # Always include geom (needed for WKB, bbox, and validation)
-    if "geom" not in keep_cols:
-        keep_cols.append("geom")
+    if has_mapping:
+        if not keep_cols:
+            keep_cols = ["geom"]
+        elif "geom" not in keep_cols:
+            keep_cols.append("geom")
     rename_map = {
         c["original"]: c["renamed"]
         for c in column_mapping
@@ -168,6 +176,27 @@ def _run_single_file(
 
     mode = "valid" if keep_valid else "invalid"
     table_name = dataset_name if keep_valid else f"{dataset_name}_rejects"
+
+    # Pre-check: when upserting a delta file with data_date into an existing
+    # table that was created without it, add the column first. DuckLake's
+    # MERGE INTO requires matching column counts between source and target.
+    # (DuckLake schema evolution handles reads across snapshots for the new
+    # column — old data fills NULL — but the write path needs ALTER TABLE.)
+    if data_date and write_mode == "upsert" and keep_valid:
+        try:
+            from db import ducklake_db
+            with ducklake_db(catalog=metadata_path, require_catalog=False) as db:
+                cols = [r[0] for r in db.execute(
+                    f"DESCRIBE vworld.{quote_ident(table_name)}"
+                ).fetchall()]
+                if "data_date" not in cols:
+                    db.execute(
+                        f"ALTER TABLE vworld.{quote_ident(table_name)} ADD COLUMN data_date DATE"
+                    )
+                    logger.info("Added data_date column to %s for delta upsert", table_name)
+        except Exception:
+            # Table doesn't exist yet — first pipeline run creates it with all columns
+            pass
 
     # Handle .zip files: unzip to temp dir, pass the spatial file to duckle
     read_path = shapefile_path
@@ -223,12 +252,13 @@ def _run_single_file(
                 os.path.basename(read_path),
             )
 
-        # 2. Drop columns: OGC_FID + user-dropped
-        if drop_cols:
+        # 2. Drop columns: user-dropped (only when mapping is provided)
+        if has_mapping and drop_cols:
             p.transform("xf.dropcol", columns=drop_cols)
 
-        # 3. Project: keep only non-dropped columns (+ geom)
-        p.transform("xf.project", columns=keep_cols)
+        # 3. Project: only when mapping is provided; otherwise pass all columns
+        if has_mapping and keep_cols:
+            p.transform("xf.project", columns=keep_cols)
 
         # 4. Rename: apply user renames (use Pipeline.rename, not xf.rename)
         if rename_map:
