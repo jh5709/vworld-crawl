@@ -117,6 +117,18 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [batchSize, setBatchSize] = useState(3); // smaller default for testing
 
+  // --- Re-crawl state ---
+  const [recrawling, setRecrawling] = useState(false);
+  const [recrawlResult, setRecrawlResult] = useState<{
+    discovered_total: number;
+    new_count: number;
+    unchanged_count: number;
+    updated_count: number;
+    new: CrawlFile[];
+    unchanged: CrawlFile[];
+    updated: CrawlFile[];
+  } | null>(null);
+
   // --- Load env credentials on mount ---
   const envLoaded = useRef(false);
   useEffect(() => {
@@ -248,6 +260,33 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
   const handleStopDiscovery = async () => {
     await fetch("/api/crawler/discover/stop", { method: "POST" });
     setDiscovering(false);
+  };
+
+  const handleRecrawl = async () => {
+    if (!host) return;
+    setRecrawling(true);
+    setRecrawlResult(null);
+    try {
+      const res = await fetch("/api/crawler/recrawl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ page_url: host.trim(), auto: discoveryMode === "auto" }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        setDiscoveryError(data.error);
+        return;
+      }
+      setRecrawlResult(data);
+      // Pre-select new + updated files
+      const allChanged = [...(data.new || []), ...(data.updated || [])];
+      setSelectedUrls(new Set(allChanged.map((f: CrawlFile) => f.url)));
+      setDiscoveredFiles(allChanged);
+    } catch (e: any) {
+      setDiscoveryError(e.message || "Re-crawl failed");
+    } finally {
+      setRecrawling(false);
+    }
   };
 
   // --- Selection ---
@@ -520,6 +559,16 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
                       <ChevronRight className="w-3.5 h-3.5" /> Next Page
                     </button>
                   )}
+                  {connected && host && (
+                    <button
+                      onClick={handleRecrawl}
+                      disabled={recrawling || discovering}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/30 rounded text-xs font-medium text-emerald-400 transition-colors disabled:opacity-40"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${recrawling ? "animate-spin" : ""}`} />
+                      {recrawling ? "Re-crawling..." : "Re-crawl"}
+                    </button>
+                  )}
                 </>
               )}
               {totalPages > 1 && (
@@ -538,6 +587,30 @@ export default function CrawlerPanel({ onFilesDownloaded, onScanDir }: CrawlerPa
             {discoveryError && (
               <div className="flex items-start gap-2 p-2 rounded bg-red-500/10 text-xs text-red-400">
                 <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" /> {discoveryError}
+              </div>
+            )}
+
+            {/* Re-crawl results */}
+            {recrawlResult && (
+              <div className="mt-3 p-3 rounded bg-emerald-500/5 border border-emerald-500/20 space-y-2">
+                <div className="flex items-center gap-2 text-xs font-medium text-emerald-400">
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Re-crawl complete — {recrawlResult.discovered_total} files
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-[11px]">
+                  <div className="px-2 py-1 rounded bg-emerald-500/10 text-emerald-300">
+                    +{recrawlResult.new_count} new
+                  </div>
+                  <div className="px-2 py-1 rounded bg-amber-500/10 text-amber-300">
+                    ~{recrawlResult.updated_count} updated
+                  </div>
+                  <div className="px-2 py-1 rounded bg-neutral-800 text-neutral-500">
+                    {recrawlResult.unchanged_count} unchanged
+                  </div>
+                </div>
+                <p className="text-[11px] text-neutral-500">
+                  New + updated files pre-selected for download. Unchanged files skipped.
+                </p>
               </div>
             )}
           </div>

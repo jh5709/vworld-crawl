@@ -75,6 +75,9 @@ def _run_single_file(
     metadata_path: str,
     *,
     keep_valid: bool,
+    data_date: str | None = None,
+    write_mode: str = "append",
+    conflict_columns: list[str] | None = None,
     progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
 ) -> list[NodeProgress]:
     """
@@ -150,11 +153,19 @@ def _run_single_file(
         if rename_map:
             p.rename(**rename_map)
 
-        # 5. SQL: add WKB + bounding box columns
+        # 5. SQL: add WKB + bounding box + data_date columns
+        data_date_sql = ""
+        if data_date:
+            # Add data_date as a literal column for delta files
+            date_cols = ", " + ", ".join(
+                f"'{data_date}'::DATE AS {c}" for c in ["data_date"]
+            )
+        else:
+            date_cols = ""
         p.transform(
             "code.sql",
-            sql="""
-            SELECT *,
+            sql=f"""
+            SELECT *{date_cols},
                    ST_AsWKB(geom) AS geom_wkb,
                    ST_XMin(geom) AS bbox_xmin,
                    ST_YMin(geom) AS bbox_ymin,
@@ -167,14 +178,19 @@ def _run_single_file(
         # 6. Validate: split valid/invalid geometries
         p.transform("qa.geomvalidate", geometryColumn="geom", mode=mode)
 
-        # 7. Sink: write to DuckLake
-        p.sink(
-            "snk.ducklake",
-            path=metadata_path,
-            dataPath=data_path,
-            tableName=table_name,
-            mode="append",
-        )
+        # 7. Sink: write to DuckLake (append or upsert for delta files)
+        sink_props: dict = {
+            "path": metadata_path,
+            "dataPath": data_path,
+            "tableName": table_name,
+            "mode": write_mode if not keep_valid else write_mode,  # always append for rejects
+        }
+        if write_mode == "upsert" and conflict_columns and keep_valid:
+            sink_props["conflictColumns"] = conflict_columns
+        # rejects always append
+        if not keep_valid:
+            sink_props["mode"] = "append"
+        p.sink("snk.ducklake", **sink_props)
 
         # Capture duckle's stdout to parse progress
         buf = io.StringIO()
@@ -221,6 +237,9 @@ def run_pipeline(
     column_mapping: list[dict],
     data_path: str | None = None,
     metadata_path: str | None = None,
+    data_date: str | None = None,
+    write_mode: str = "append",
+    conflict_columns: list[str] | None = None,
     progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
 ) -> PipelineResult:
     """
@@ -288,6 +307,9 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=True,
+                data_date=data_date,
+                write_mode=write_mode,
+                conflict_columns=conflict_columns,
                 progress_callback=progress_callback,
             )
 
@@ -305,6 +327,9 @@ def run_pipeline(
                 data_path,
                 metadata_path,
                 keep_valid=False,
+                data_date=data_date,
+                write_mode=write_mode,
+                conflict_columns=conflict_columns,
                 progress_callback=progress_callback,
             )
 

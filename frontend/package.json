@@ -9,18 +9,24 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@deck.gl/geo-layers": "^9.3.7",
+    "@deck.gl/layers": "^9.3.7",
+    "@deck.gl/react": "^9.3.7",
     "clsx": "^2.1.1",
+    "deck.gl": "^9.3.7",
     "lucide-react": "^0.468.0",
-    "tailwind-merge": "^2.6.0",
+    "maplibre-gl": "^6.1.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-map-gl": "^8.1.2",
+    "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.0.0",
-    "@tailwindcss/vite": "^4.0.0",
     "typescript": "~5.7.0",
     "vite": "^6.0.0"
   }

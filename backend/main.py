@@ -190,7 +190,8 @@ from crawler.download import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_DOWNLOAD_DIR,
 )
-from crawler.state import CrawlEntry, upsert_entry, link_to_dataset, get_entries_by_dataset, cleanup_source_files, get_staged_entries, delete_staged_files
+from crawler.state import CrawlEntry, upsert_entry, link_to_dataset, get_entries_by_dataset, cleanup_source_files, get_staged_entries, delete_staged_files, check_changes
+from map_api import get_bounds, get_stats, get_features, get_attributes
 
 # Module-level crawler state (single-user app)
 import concurrent.futures
@@ -205,6 +206,9 @@ class PipelineRequest(BaseModel):
     paths: list[str]
     dataset_name: str
     column_mapping: list[dict]
+    data_date: str = ""                 # date string for delta files (YYYY-MM-DD or empty)
+    write_mode: str = "append"          # "append" | "upsert"
+    conflict_columns: list[str] = []     # upsert key columns when write_mode="upsert"
 
 
 @app.post("/api/run-pipeline")
@@ -217,6 +221,9 @@ async def api_run_pipeline(req: PipelineRequest):
             column_mapping=req.column_mapping,
             data_path=str(data_path()),
             metadata_path=str(metadata_path()),
+            data_date=req.data_date or None,
+            write_mode=req.write_mode,
+            conflict_columns=req.conflict_columns,
         )
 
         if result.error:
@@ -264,6 +271,9 @@ async def ws_pipeline(ws: WebSocket):
         paths = params.get("paths", [])
         dataset_name = params.get("dataset_name", "")
         column_mapping = params.get("column_mapping", [])
+        data_date = params.get("data_date", "")
+        write_mode = params.get("write_mode", "append")
+        conflict_columns = params.get("conflict_columns", [])
         
         if not paths or not dataset_name:
             await ws.send_text(_json.dumps({
@@ -305,6 +315,9 @@ async def ws_pipeline(ws: WebSocket):
                 column_mapping=column_mapping,
                 data_path=str(data_path()),
                 metadata_path=str(metadata_path()),
+                data_date=data_date or None,
+                write_mode=write_mode,
+                conflict_columns=conflict_columns,
                 progress_callback=lambda p: asyncio.run_coroutine_threadsafe(
                     send_progress(p), loop
                 ),
@@ -445,6 +458,76 @@ async def api_compact_table(table_name: str):
 async def api_reindex_table(table_name: str):
     """Reindex a table by rewriting data files."""
     return reindex_table(table_name)
+
+
+# ---------------------------------------------------------------------------
+# Map preview endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/tables/{table_name}/bounds")
+async def api_table_bounds(table_name: str):
+    """Full-table bounding box for map preview."""
+    bounds = get_bounds(table_name)
+    if bounds is None:
+        return {"error": "No spatial data found"}
+    return {
+        "table": table_name,
+        "xmin": bounds.xmin, "ymin": bounds.ymin,
+        "xmax": bounds.xmax, "ymax": bounds.ymax,
+    }
+
+
+@app.get("/api/tables/{table_name}/stats")
+async def api_table_stats(table_name: str):
+    """Per-column statistics for the whole table."""
+    return get_stats(table_name)
+
+
+class FeaturesRequest(BaseModel):
+    xmin: float | None = None
+    ymin: float | None = None
+    xmax: float | None = None
+    ymax: float | None = None
+    limit: int | None = None
+
+
+@app.post("/api/tables/{table_name}/features")
+async def api_table_features(table_name: str, req: FeaturesRequest):
+    """GeoJSON features from a table, optionally filtered by bounding box."""
+    try:
+        return get_features(
+            table_name,
+            xmin=req.xmin, ymin=req.ymin,
+            xmax=req.xmax, ymax=req.ymax,
+            limit=req.limit,
+        )
+    except Exception as e:
+        logger.exception("Features query failed for %s", table_name)
+        return {"error": str(e)}
+
+
+class AttributesRequest(BaseModel):
+    xmin: float | None = None
+    ymin: float | None = None
+    xmax: float | None = None
+    ymax: float | None = None
+    offset: int = 0
+    limit: int = 100
+
+
+@app.post("/api/tables/{table_name}/attributes")
+async def api_table_attributes(table_name: str, req: AttributesRequest):
+    """Paginated attribute rows for the attribute table view."""
+    try:
+        return get_attributes(
+            table_name,
+            xmin=req.xmin, ymin=req.ymin,
+            xmax=req.xmax, ymax=req.ymax,
+            offset=req.offset, limit=req.limit,
+        )
+    except Exception as e:
+        logger.exception("Attributes query failed for %s", table_name)
+        return {"error": str(e)}
 
 
 @app.post("/api/ducklake/expire-snapshots")
@@ -882,6 +965,97 @@ async def api_crawler_staged_delete(req: StagedDeleteRequest):
     except Exception as e:
         logger.exception("Staged delete failed")
         return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Re-crawl (incremental)
+# ---------------------------------------------------------------------------
+
+class RecrawlRequest(BaseModel):
+    page_url: str
+    auto: bool = True           # auto-paginate all pages
+
+
+def _detect_delta_date(file_name: str) -> str | None:
+    """Detect a date embedded in a filename for delta-file identification.
+
+    Common VWorld / geospatial portal patterns:
+      20250801_{dataset}.zip     roads_2025-08-01.zip
+      {dataset}_delta_20250801   delta_202508_roads.shp
+
+    Returns ISO date string (YYYY-MM-DD) if detected, None otherwise.
+    """
+    import re
+    patterns = [
+        # 20250801 or 2025-08-01
+        (r'(\d{4})(\d{2})(\d{2})', lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}"),
+        (r'(\d{4})-(\d{2})-(\d{2})', lambda m: m.group(0)),
+    ]
+    for pat, fmt in patterns:
+        match = re.search(pat, file_name)
+        if match:
+            return fmt(match)
+    return None
+
+
+@app.post("/api/crawler/recrawl")
+async def api_crawler_recrawl(req: RecrawlRequest):
+    """Re-discover files and compare against crawl_state for incremental crawl.
+
+    Returns file lists partitioned into new/unchanged/updated based on
+    ETag and Last-Modified comparison.
+    """
+    global _discovery_state
+    session = _crawler_session
+    if session is None:
+        return {"success": False, "error": "No active session. Connect first."}
+
+    _discovery_state = DiscoveryState()
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        files_raw = await loop.run_in_executor(
+            pool,
+            lambda: (
+                discover_all_pages(session, req.page_url, _discovery_state)
+                if req.auto
+                else discover_page(session, req.page_url, _discovery_state, page_num=1)
+            ),
+        )
+
+    # Build list for check_changes (dicts with url, etag, last_modified)
+    discovered = [
+        {
+            "url": f.get("url", ""),
+            "name": f.get("name", ""),
+            "size": f.get("size", 0),
+            "size_str": f.get("size_str", ""),
+            "date": f.get("date", ""),
+            "description": f.get("description", ""),
+            "etag": f.get("etag", ""),
+            "last_modified": f.get("last_modified", ""),
+        }
+        for f in files_raw
+    ]
+
+    # Split into new/unchanged/updated
+    changes = check_changes(discovered)
+
+    # Detect potential delta files
+    for f in changes.get("new", []) + changes.get("updated", []):
+        date = _detect_delta_date(f.get("name", ""))
+        f["delta_date"] = date
+
+    return {
+        "success": True,
+        "discovered_total": len(discovered),
+        "new_count": len(changes.get("new", [])),
+        "unchanged_count": len(changes.get("unchanged", [])),
+        "updated_count": len(changes.get("updated", [])),
+        "new": changes.get("new", []),
+        "unchanged": changes.get("unchanged", []),
+        "updated": changes.get("updated", []),
+    }
 
 
 @app.post("/api/crawler/cleanup/{dataset_name}")

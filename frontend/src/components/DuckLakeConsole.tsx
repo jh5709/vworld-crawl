@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import {
   Database, RefreshCw, HardDrive, Trash2, Clock,
   AlertTriangle, ChevronRight, Eye, Info,
-  Download, FileArchive,
+  Download, FileArchive, Map,
 } from "lucide-react";
 
 interface CrawlSourceFile {
@@ -81,8 +81,10 @@ function formatDate(ts: string | null): string {
 
 export default function DuckLakeConsole({
   onLoadToPipeline,
+  onViewMap,
 }: {
   onLoadToPipeline?: (filePath: string) => void;
+  onViewMap?: (tableName: string) => void;
 }) {
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -391,6 +393,15 @@ export default function DuckLakeConsole({
                 >
                   <RefreshCw className="w-3 h-3" />
                 </button>
+                {onViewMap && (
+                  <button
+                    onClick={() => onViewMap(t.name)}
+                    className="px-2 py-0.5 text-[11px] text-emerald-500/80 hover:text-emerald-400 hover:bg-neutral-800 rounded transition-colors"
+                    title="View on map"
+                  >
+                    <Map className="w-3 h-3" />
+                  </button>
+                )}
               </div>
             </div>
 

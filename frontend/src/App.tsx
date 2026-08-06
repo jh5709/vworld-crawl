@@ -3,6 +3,7 @@ import { Database, Layers } from "lucide-react";
 import DirectoryPicker from "@/components/DirectoryPicker";
 import CrawlerPanel from "@/components/CrawlerPanel";
 import DuckLakeConsole from "@/components/DuckLakeConsole";
+import MapPreview from "@/components/MapPreview";
 import FileGrid, { type FileEntry } from "@/components/FileGrid";
 import SchemaEditor, {
   type ColumnDef,
@@ -21,6 +22,9 @@ export default function App() {
   const [scanLoading, setScanLoading] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Map preview
+  const [mapTable, setMapTable] = useState<string | null>(null);
 
   // Schema detection
   const [inspectFile, setInspectFile] = useState<FileEntry | null>(null);
@@ -390,6 +394,15 @@ export default function App() {
               const dir = filePath.slice(0, filePath.lastIndexOf("/")) || filePath;
               handleScan(dir);
             }}
+            onViewMap={(tableName) => setMapTable(tableName)}
+          />
+        )}
+
+        {/* Map preview overlay */}
+        {mapTable && (
+          <MapPreview
+            tableName={mapTable}
+            onClose={() => setMapTable(null)}
           />
         )}
       </main>
